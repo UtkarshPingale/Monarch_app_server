@@ -3329,13 +3329,18 @@ def update_user(user_id=None, user_id_str=None):
         conn_m = get_monarch_connection()
         cur_m = conn_m.cursor()
 
-        # Check by id or employee_no
-        cur_m.execute("""
-            SELECT id FROM data.users 
-            WHERE id = %s OR employee_no = %s
-            LIMIT 1;
-        """, (int(ident) if str(ident).isdigit() else -1, int(ident) if str(ident).isdigit() else -1))
-        existing = cur_m.fetchone()
+        # Check by id (primary key takes precedence), fallback to employee_no
+        existing = None
+        if str(ident).isdigit():
+            val = int(ident)
+            cur_m.execute("SELECT id FROM data.users WHERE id = %s LIMIT 1;", (val,))
+            existing = cur_m.fetchone()
+            if not existing:
+                cur_m.execute("SELECT id FROM data.users WHERE employee_no = %s LIMIT 1;", (val,))
+                existing = cur_m.fetchone()
+        else:
+            cur_m.execute("SELECT id FROM data.users WHERE employee_no = %s OR username = %s LIMIT 1;", (str(ident), str(ident)))
+            existing = cur_m.fetchone()
         if not existing:
             return jsonify({'error': f'User not found for identifier: {ident}'}), 404
 
@@ -4941,13 +4946,18 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
             conn = get_monarch_connection()
             cur = conn.cursor()
 
-            # Fetch existing by id OR employee_no
-            cur.execute("""
-                SELECT * FROM data.users 
-                WHERE id = %s OR employee_no = %s
-                LIMIT 1;
-            """, (int(ident) if str(ident).isdigit() else -1, int(ident) if str(ident).isdigit() else -1))
-            before = cur.fetchone()
+            # Fetch existing by id (primary key takes precedence), fallback to employee_no
+            before = None
+            if str(ident).isdigit():
+                val = int(ident)
+                cur.execute("SELECT * FROM data.users WHERE id = %s LIMIT 1;", (val,))
+                before = cur.fetchone()
+                if not before:
+                    cur.execute("SELECT * FROM data.users WHERE employee_no = %s LIMIT 1;", (val,))
+                    before = cur.fetchone()
+            else:
+                cur.execute("SELECT * FROM data.users WHERE employee_no = %s OR username = %s LIMIT 1;", (str(ident), str(ident)))
+                before = cur.fetchone()
             if not before:
                 return jsonify({'error': f'Employee record not found for {ident}'}), 404
 
@@ -5132,12 +5142,17 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
         try:
             conn = get_monarch_connection()
             cur = conn.cursor()
-            cur.execute("""
-                SELECT * FROM data.users 
-                WHERE id = %s OR employee_no = %s
-                LIMIT 1;
-            """, (int(ident) if str(ident).isdigit() else -1, int(ident) if str(ident).isdigit() else -1))
-            user = cur.fetchone()
+            user = None
+            if str(ident).isdigit():
+                val = int(ident)
+                cur.execute("SELECT * FROM data.users WHERE id = %s LIMIT 1;", (val,))
+                user = cur.fetchone()
+                if not user:
+                    cur.execute("SELECT * FROM data.users WHERE employee_no = %s LIMIT 1;", (val,))
+                    user = cur.fetchone()
+            else:
+                cur.execute("SELECT * FROM data.users WHERE employee_no = %s OR username = %s LIMIT 1;", (str(ident), str(ident)))
+                user = cur.fetchone()
             if not user:
                 return jsonify({'error': 'Employee not found'}), 404
 
@@ -6176,9 +6191,20 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
             conn = get_monarch_connection()
             cur = conn.cursor()
 
-            # Lookup employee name and department
-            cur.execute("SELECT name, department, role FROM data.users WHERE employee_no = %s OR id = %s;", (emp_id if emp_id.isdigit() else 0, emp_id if emp_id.isdigit() else 0))
-            u_info = cur.fetchone() or {'name': f"Employee {emp_id}", 'department': 'Operations', 'role': 'employee'}
+            # Lookup employee name and department (employee_no takes precedence)
+            u_info = None
+            if emp_id.isdigit():
+                val = int(emp_id)
+                cur.execute("SELECT name, department, role FROM data.users WHERE employee_no = %s LIMIT 1;", (val,))
+                u_info = cur.fetchone()
+                if not u_info:
+                    cur.execute("SELECT name, department, role FROM data.users WHERE id = %s LIMIT 1;", (val,))
+                    u_info = cur.fetchone()
+            else:
+                cur.execute("SELECT name, department, role FROM data.users WHERE employee_no = %s OR username = %s LIMIT 1;", (emp_id, emp_id))
+                u_info = cur.fetchone()
+            if not u_info:
+                u_info = {'name': f"Employee {emp_id}", 'department': 'Operations', 'role': 'employee'}
 
             cur.execute("""
                 INSERT INTO data.attendance (
@@ -6753,9 +6779,20 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
                 ALTER TABLE data.leaves ADD COLUMN IF NOT EXISTS to_session VARCHAR(50);
             """)
 
-            # Lookup employee
-            cur.execute("SELECT name, department FROM data.users WHERE employee_no = %s OR id = %s;", (int(emp_id) if emp_id.isdigit() else 0, int(emp_id) if emp_id.isdigit() else 0))
-            u_info = cur.fetchone() or {'name': f"Employee {emp_id}", 'department': 'Operations'}
+            # Lookup employee (employee_no takes precedence)
+            u_info = None
+            if str(emp_id).isdigit():
+                val = int(emp_id)
+                cur.execute("SELECT name, department FROM data.users WHERE employee_no = %s LIMIT 1;", (val,))
+                u_info = cur.fetchone()
+                if not u_info:
+                    cur.execute("SELECT name, department FROM data.users WHERE id = %s LIMIT 1;", (val,))
+                    u_info = cur.fetchone()
+            else:
+                cur.execute("SELECT name, department FROM data.users WHERE employee_no = %s OR username = %s LIMIT 1;", (str(emp_id), str(emp_id)))
+                u_info = cur.fetchone()
+            if not u_info:
+                u_info = {'name': f"Employee {emp_id}", 'department': 'Operations'}
 
             session_text = f" ({session})" if is_half_day and session else ""
             final_title = title or f"{leave_type}{session_text}"
@@ -7109,11 +7146,25 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
             cur = conn.cursor()
 
             for eid in emp_ids:
-                cur.execute("""
-                    UPDATE data.users
-                    SET shift_timing = %s, shift_id = %s
-                    WHERE employee_no = %s OR id = %s;
-                """, (shift_timing, shift_id, eid if str(eid).isdigit() else 0, eid if str(eid).isdigit() else 0))
+                eid_str = str(eid).strip()
+                target_user = None
+                if eid_str.isdigit():
+                    val = int(eid_str)
+                    cur.execute("SELECT id FROM data.users WHERE employee_no = %s LIMIT 1;", (val,))
+                    target_user = cur.fetchone()
+                    if not target_user:
+                        cur.execute("SELECT id FROM data.users WHERE id = %s LIMIT 1;", (val,))
+                        target_user = cur.fetchone()
+                else:
+                    cur.execute("SELECT id FROM data.users WHERE employee_no = %s OR username = %s LIMIT 1;", (eid_str, eid_str))
+                    target_user = cur.fetchone()
+
+                if target_user:
+                    cur.execute("""
+                        UPDATE data.users
+                        SET shift_timing = %s, shift_id = %s
+                        WHERE id = %s;
+                    """, (shift_timing, shift_id, target_user['id']))
 
             conn.commit()
 
