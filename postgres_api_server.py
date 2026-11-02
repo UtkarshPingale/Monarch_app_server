@@ -2992,14 +2992,26 @@ def review_team_leave(leave_id):
         """, (new_status, caller_emp_id, now_ts, note if action == 'reject' else None, leave_id))
         updated_leave = cur.fetchone()
 
-        # If approved and not Loss Of Pay, adjust leave balance
-        if action == 'approve' and leave_row.get('leave_type') not in ['Loss Of Pay', 'Loss of Pay', 'LOP', 'Regularization', 'Attendance Regularization', 'Work From Home']:
+        # If approved and not Loss Of Pay / Regularization, adjust leave balance
+        leave_type_lower = str(leave_row.get('leave_type') or '').strip().lower()
+        is_non_deductible = any(nd in leave_type_lower for nd in ['loss of pay', 'lop', 'unpaid', 'regulariz', 'comp - off', 'comp-off', 'compoff', 'work from home', 'wfh'])
+        if action == 'approve' and not is_non_deductible and leave_row.get('status') != 'Approved':
             days = float(leave_row.get('days_count') or 1.0)
             target_emp = str(leave_row['employee_id'])
             cur.execute("""
                 UPDATE leave_balances
                 SET used_days = used_days + %s,
                     remaining_days = GREATEST(0.0, remaining_days - %s),
+                    updated_at = NOW()
+                WHERE employee_id = %s OR employee_id = %s;
+            """, (days, days, target_emp, target_emp.lstrip('0')))
+        elif action == 'reject' and not is_non_deductible and leave_row.get('status') == 'Approved':
+            days = float(leave_row.get('days_count') or 1.0)
+            target_emp = str(leave_row['employee_id'])
+            cur.execute("""
+                UPDATE leave_balances
+                SET used_days = GREATEST(0.0, used_days - %s),
+                    remaining_days = remaining_days + %s,
                     updated_at = NOW()
                 WHERE employee_id = %s OR employee_id = %s;
             """, (days, days, target_emp, target_emp.lstrip('0')))
@@ -6634,8 +6646,11 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
                     WHERE id = %s;
                 """, (request.user.get('name'), leave_id))
 
-                # Deduct balance only if not already approved
-                if old_status != 'Approved':
+                # Deduct balance only if not already approved AND not a non-deductible type (Regularization / Loss of Pay / Comp-Off)
+                leave_type_lower = str(leave_req.get('leave_type') or '').strip().lower()
+                is_non_deductible = any(nd in leave_type_lower for nd in ['loss of pay', 'lop', 'unpaid', 'regulariz', 'comp - off', 'comp-off', 'compoff', 'work from home', 'wfh'])
+
+                if old_status != 'Approved' and not is_non_deductible:
                     cur.execute("""
                         INSERT INTO data.leave_balances (employee_id, total_allotted, used_days, remaining_days, updated_at)
                         VALUES (%s, 6.0, %s, 6.0 - %s, NOW())
@@ -6658,8 +6673,11 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
                     WHERE id = %s;
                 """, (request.user.get('name'), reason, leave_id))
 
-                # Refund balance if was previously approved
-                if old_status == 'Approved':
+                leave_type_lower = str(leave_req.get('leave_type') or '').strip().lower()
+                is_non_deductible = any(nd in leave_type_lower for nd in ['loss of pay', 'lop', 'unpaid', 'regulariz', 'comp - off', 'comp-off', 'compoff', 'work from home', 'wfh'])
+
+                # Refund balance if was previously approved AND was a deductible leave
+                if old_status == 'Approved' and not is_non_deductible:
                     cur.execute("""
                         UPDATE data.leave_balances
                         SET used_days = GREATEST(0.0, used_days - %s),
@@ -6758,15 +6776,18 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
             ))
             new_id = cur.fetchone()['id']
 
-            # Deduct balance
-            cur.execute("""
-                INSERT INTO data.leave_balances (employee_id, total_allotted, used_days, remaining_days, updated_at)
-                VALUES (%s, 6.0, %s, 6.0 - %s, NOW())
-                ON CONFLICT (employee_id) DO UPDATE
-                SET used_days = data.leave_balances.used_days + EXCLUDED.used_days,
-                    remaining_days = data.leave_balances.remaining_days - EXCLUDED.used_days,
-                    updated_at = NOW();
-            """, (emp_id, days_count, days_count))
+            # Deduct balance only if deductible leave type (not Regularization, Loss of Pay, Comp-Off)
+            leave_type_lower = str(leave_type or '').strip().lower()
+            is_non_deductible = any(nd in leave_type_lower for nd in ['loss of pay', 'lop', 'unpaid', 'regulariz', 'comp - off', 'comp-off', 'compoff', 'work from home', 'wfh'])
+            if not is_non_deductible:
+                cur.execute("""
+                    INSERT INTO data.leave_balances (employee_id, total_allotted, used_days, remaining_days, updated_at)
+                    VALUES (%s, 6.0, %s, 6.0 - %s, NOW())
+                    ON CONFLICT (employee_id) DO UPDATE
+                    SET used_days = data.leave_balances.used_days + EXCLUDED.used_days,
+                        remaining_days = data.leave_balances.remaining_days - EXCLUDED.used_days,
+                        updated_at = NOW();
+                """, (emp_id, days_count, days_count))
 
             conn.commit()
 
@@ -13864,21 +13885,36 @@ def run_full_biometric_sync():
 
 
 def run_incremental_biometric_sync():
-    """Lightweight sync for background loop: checks current month table for punches in the last 48 hours."""
+    """Lightweight sync for background loop: checks current month table (and previous month near month start) for punches in the last 48-72 hours."""
     try:
         monarch_conn = get_monarch_connection()
         app_conn = get_db_connection()
 
         today = get_ist_today()
-        active_tbl = f"devicelogs_{today.month}_{today.year}"
         since_dt = datetime.datetime.combine(today - datetime.timedelta(days=1), datetime.time.min)
 
         users_map = load_monarch_users_map()
+        total_ins, total_upd = 0, 0
+
+        # 1. Always sync current month
+        active_tbl = f"devicelogs_{today.month}_{today.year}"
         ins, upd = sync_biometric_table(active_tbl, monarch_conn, app_conn, users_map, since_date=since_dt)
+        total_ins += ins
+        total_upd += upd
+
+        # 2. During first 5 days of a new month, also sync previous month so end-of-month punches are never missed
+        if today.day <= 5:
+            first_of_month = today.replace(day=1)
+            prev_month_dt = first_of_month - datetime.timedelta(days=1)
+            prev_tbl = f"devicelogs_{prev_month_dt.month}_{prev_month_dt.year}"
+            prev_since = datetime.datetime.combine(prev_month_dt - datetime.timedelta(days=2), datetime.time.min)
+            ins2, upd2 = sync_biometric_table(prev_tbl, monarch_conn, app_conn, users_map, since_date=prev_since)
+            total_ins += ins2
+            total_upd += upd2
 
         monarch_conn.close()
         app_conn.close()
-        return ins, upd
+        return total_ins, total_upd
     except Exception as e:
         logger.error(f"Incremental biometric sync error: {e}")
         return 0, 0
