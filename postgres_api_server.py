@@ -1122,6 +1122,8 @@ def format_attendance_record(r):
         'reviewed_by': row.get('reviewed_by'),
         'reviewed_at': rev_at,
         'rejection_reason': row.get('rejection_reason'),
+        'vehicle_photo_in': row.get('vehicle_photo_in'),
+        'vehicle_photo_out': row.get('vehicle_photo_out'),
     }
 
 
@@ -1449,8 +1451,12 @@ def update_user_profile():
             return jsonify({'error': 'Invalid email format. Please provide a valid email address (e.g. employee@monarch.com).'}), 400
 
     full_name = data.get('full_name') or data.get('name')
-    department = data.get('department')
-    designation = data.get('designation')
+    # Users cannot change department and designation from their own profile;
+    # Only Admin / HR can modify department and designation via backend/admin management.
+    caller_role = normalize_role(request.user.get('role'))
+    is_admin_or_hr = caller_role in ['admin', 'superadmin', 'hr', 'director']
+    department = data.get('department') if is_admin_or_hr else None
+    designation = data.get('designation') if is_admin_or_hr else None
 
     date_of_joining = None
     if joining_date_str:
@@ -1943,6 +1949,7 @@ def clock_in():
 
         location_str = nearest_bldg or 'Mobile App (GPS)'
 
+        vehicle_photo = data.get('vehicle_photo') or data.get('vehicle_photo_in')
         if existing_att:
             cur.execute("""
                 UPDATE attendance
@@ -1955,12 +1962,13 @@ def clock_in():
                     clock_in_lng = %s,
                     department = %s,
                     role = %s,
-                    approval_status = %s
+                    approval_status = %s,
+                    vehicle_photo_in = COALESCE(%s, vehicle_photo_in)
                 WHERE id = %s
                 RETURNING id;
             """, (
                 now_time, location_str, in_geofence, nearest_bldg, dist_m,
-                lat, lng, user_dept, user_role, approval_status, existing_att['id']
+                lat, lng, user_dept, user_role, approval_status, vehicle_photo, existing_att['id']
             ))
             att_row = cur.fetchone()
         else:
@@ -1968,18 +1976,21 @@ def clock_in():
                 INSERT INTO attendance (
                     employee_id, employee_name, date, sign_in, location,
                     in_geofence, nearest_building, distance_meters,
-                    clock_in_lat, clock_in_lng, department, role, approval_status
+                    clock_in_lat, clock_in_lng, department, role, approval_status,
+                    vehicle_photo_in
                 )
                 VALUES (
                     %s, %s, %s, %s, %s,
                     %s, %s, %s,
-                    %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s,
+                    %s
                 )
                 RETURNING id;
             """, (
                 emp_id, emp_name, today, now_time, location_str,
                 in_geofence, nearest_bldg, dist_m,
-                lat, lng, user_dept, user_role, approval_status
+                lat, lng, user_dept, user_role, approval_status,
+                vehicle_photo
             ))
             att_row = cur.fetchone()
 
@@ -2093,6 +2104,7 @@ def clock_out():
         else:
             out_approval = 'Pending TL Approval'
 
+        vehicle_photo = data.get('vehicle_photo') or data.get('vehicle_photo_out')
         cur.execute("""
             UPDATE attendance
             SET sign_out = %s,
@@ -2100,10 +2112,11 @@ def clock_out():
                 clock_out_lng = %s,
                 clock_out_in_geofence = %s,
                 clock_out_distance_meters = %s,
-                approval_status = %s
+                approval_status = %s,
+                vehicle_photo_out = COALESCE(%s, vehicle_photo_out)
             WHERE id = %s
             RETURNING id;
-        """, (now_time, lat, lng, out_in_geofence, out_dist_m, out_approval, active_record['id']))
+        """, (now_time, lat, lng, out_in_geofence, out_dist_m, out_approval, vehicle_photo, active_record['id']))
         updated_row = cur.fetchone()
 
         # Record raw punch in data.devicelogs_M_YYYY
@@ -2140,7 +2153,8 @@ def get_my_attendance():
             SELECT id, employee_id, employee_name, date, sign_in, sign_out, location,
                    in_geofence, nearest_building, distance_meters, clock_in_lat, clock_in_lng,
                    clock_out_lat, clock_out_lng, clock_out_in_geofence, clock_out_distance_meters,
-                   department, role, approval_status, reviewed_by, reviewed_at, rejection_reason
+                   department, role, approval_status, reviewed_by, reviewed_at, rejection_reason,
+                   vehicle_photo_in, vehicle_photo_out
             FROM attendance
             WHERE employee_id = %s OR employee_id = %s OR employee_id = %s
             ORDER BY date DESC, sign_in DESC;
@@ -2188,7 +2202,8 @@ def get_team_punch_requests():
             SELECT id, employee_id, employee_name, date, sign_in, sign_out, location,
                    in_geofence, nearest_building, distance_meters, clock_in_lat, clock_in_lng,
                    clock_out_lat, clock_out_lng, clock_out_in_geofence, clock_out_distance_meters,
-                   department, role, approval_status, reviewed_by, reviewed_at, rejection_reason
+                   department, role, approval_status, reviewed_by, reviewed_at, rejection_reason,
+                   vehicle_photo_in, vehicle_photo_out
             FROM attendance
             WHERE approval_status IN ('Pending TL Approval', 'Pending Approval', 'Pending Sr TL Approval', 'Pending Manager Approval')
               AND employee_id != %s
@@ -2231,18 +2246,14 @@ def get_team_punch_requests():
             if is_direct_sub:
                 filtered_rows.append(r)
             # 2. SuperAdmin top-level oversight:
-            elif user_role == 'admin':
+            elif user_role in ['admin', 'superadmin', 'director']:
                 filtered_rows.append(r)
-            # 3. Department Team Leader / Senior Team Leader:
-            elif user_role in ['teamleader', 'seniorteamleader'] and (are_departments_matching(r_dept, user_dept) or not user_dept):
-                filtered_rows.append(r)
-            # 4. If employee has an assigned reporting manager who is someone else, route to that manager:
+            # 3. If employee has an assigned reporting manager who is someone else, route to that manager ONLY:
             elif emp_has_mgr:
                 continue
-            # 5. Department Manager fallback:
-            elif user_role == 'manager':
-                if are_departments_matching(r_dept, user_dept) or not user_dept:
-                    filtered_rows.append(r)
+            # 4. Fallback for unassigned employees ONLY (no manager assigned):
+            elif user_role in ['teamleader', 'seniorteamleader', 'manager'] and (are_departments_matching(r_dept, user_dept) or not user_dept):
+                filtered_rows.append(r)
 
         formatted = [format_attendance_record(r) for r in filtered_rows]
         return jsonify({'punch_requests': formatted, 'count': len(formatted)})
@@ -2296,9 +2307,9 @@ def take_punch_action(attendance_id):
 
         # Authorized if: Admin, Direct 1-on-1 reporting manager, or unassigned fallback in matching department
         is_authorized = (
-            user_role == 'admin' or
+            user_role in ['admin', 'superadmin', 'director'] or
             is_direct_mgr or
-            (user_role in ['manager', 'seniorteamleader', 'teamleader'] and (are_departments_matching(user_dept, current_att.get('department')) or not user_dept))
+            (not emp_has_mgr and user_role in ['manager', 'seniorteamleader', 'teamleader'] and (are_departments_matching(user_dept, current_att.get('department')) or not user_dept))
         )
 
         if not is_authorized:
@@ -2870,32 +2881,14 @@ def get_team_leaves():
             if is_direct_sub:
                 pass
             # 2. SuperAdmin top-level oversight:
-            elif caller_role == 'admin':
+            elif caller_role in ['admin', 'superadmin', 'director']:
                 pass
-            # 3. Department Team Leader / Senior Team Leader:
-            elif caller_role in ['teamleader', 'seniorteamleader'] and (are_departments_matching(dept, caller_dept) or not caller_dept):
-                pass
-            # 4. If employee has an assigned reporting manager who is someone else, strictly route to that manager:
+            # 3. If employee has an assigned reporting manager who is someone else, strictly route to that manager ONLY:
             elif emp_has_mgr:
                 continue
-            # 4. Fallback for unassigned employees:
-            elif caller_role == 'manager':
-                if u_role in ['admin']:
-                    continue
-                if not are_departments_matching(dept, caller_dept):
-                    continue
-            elif caller_role == 'seniorteamleader':
-                if u_role not in ['teamleader', 'employee']:
-                    continue
-                is_dept_match = are_departments_matching(dept, caller_dept)
-                is_tl_fallback = (u_role == 'employee' and not has_tl_in_dept)
-                if not (is_dept_match or is_tl_fallback):
-                    continue
-            elif caller_role == 'teamleader':
-                if u_role != 'employee':
-                    continue
-                if caller_dept and not are_departments_matching(dept, caller_dept):
-                    continue
+            # 4. Fallback for unassigned employees ONLY (no manager assigned):
+            elif caller_role in ['teamleader', 'seniorteamleader', 'manager'] and (are_departments_matching(dept, caller_dept) or not caller_dept):
+                pass
             else:
                 continue
 
@@ -2934,13 +2927,13 @@ def get_team_leaves():
 def review_team_leave(leave_id):
     caller_emp_id = str(request.user.get('emp_id') or request.user.get('id'))
     data = request.get_json() or {}
-    action = (data.get('action') or '').strip().lower()  # 'approve' or 'reject'
+    action = (data.get('action') or '').strip().lower()  # 'approve', 'reject', 'cancel', 'remove', 'revoke'
     note = data.get('note', '')
 
-    if action not in ['approve', 'reject']:
-        return jsonify({'error': 'Invalid action. Must be approve or reject.'}), 400
+    if action not in ['approve', 'reject', 'cancel', 'remove', 'revoke']:
+        return jsonify({'error': 'Invalid action. Must be approve, reject, or cancel.'}), 400
 
-    new_status = 'Approved' if action == 'approve' else 'Rejected'
+    new_status = 'Approved' if action == 'approve' else ('Cancelled' if action in ['cancel', 'remove', 'revoke'] else 'Rejected')
     now_ts = get_ist_now().replace(tzinfo=None)
 
     try:
@@ -2972,14 +2965,16 @@ def review_team_leave(leave_id):
 
         is_authorized = (
             is_direct_mgr or
-            (caller_role in ['teamleader', 'seniorteamleader', 'manager'] and (are_departments_matching(caller_dept, leave_row.get('department')) or not caller_dept))
+            caller_role in ['admin', 'superadmin', 'director'] or
+            (not emp_has_mgr and caller_role in ['teamleader', 'seniorteamleader', 'manager'] and (are_departments_matching(caller_dept, leave_row.get('department')) or not caller_dept))
         )
 
         if not is_authorized:
             cur.close()
             conn.close()
-            return jsonify({'error': 'Forbidden: Only the assigned Direct Reporting Manager has approval authority for leave requests. Admin/HR cannot approve.'}), 403
+            return jsonify({'error': 'Forbidden: Only the assigned Direct Reporting Manager has authority to review or cancel leave requests.'}), 403
 
+        review_note = note if note else (f"Cancelled by Reporting Manager" if action in ['cancel', 'remove', 'revoke'] else (note if action == 'reject' else None))
 
         cur.execute("""
             UPDATE leaves
@@ -2989,32 +2984,32 @@ def review_team_leave(leave_id):
                 rejection_reason = %s
             WHERE id = %s
             RETURNING *;
-        """, (new_status, caller_emp_id, now_ts, note if action == 'reject' else None, leave_id))
+        """, (new_status, (caller.get('name') if caller else None) or caller_emp_id, now_ts, review_note, leave_id))
         updated_leave = cur.fetchone()
 
         # If approved and not Loss Of Pay / Regularization, adjust leave balance
         leave_type_lower = str(leave_row.get('leave_type') or '').strip().lower()
         is_non_deductible = any(nd in leave_type_lower for nd in ['loss of pay', 'lop', 'unpaid', 'regulariz', 'comp - off', 'comp-off', 'compoff', 'work from home', 'wfh'])
-        if action == 'approve' and not is_non_deductible and leave_row.get('status') != 'Approved':
-            days = float(leave_row.get('days_count') or 1.0)
-            target_emp = str(leave_row['employee_id'])
+        old_status = str(leave_row.get('status') or '').strip()
+        days = float(leave_row.get('days_count') or 1.0)
+        target_emp = str(leave_row['employee_id'])
+
+        if action == 'approve' and not is_non_deductible and old_status != 'Approved':
             cur.execute("""
                 UPDATE leave_balances
                 SET used_days = used_days + %s,
                     remaining_days = GREATEST(0.0, remaining_days - %s),
                     updated_at = NOW()
-                WHERE employee_id = %s OR employee_id = %s;
-            """, (days, days, target_emp, target_emp.lstrip('0')))
-        elif action == 'reject' and not is_non_deductible and leave_row.get('status') == 'Approved':
-            days = float(leave_row.get('days_count') or 1.0)
-            target_emp = str(leave_row['employee_id'])
+                WHERE employee_id = %s OR employee_id = %s OR employee_id = %s;
+            """, (days, days, target_emp, target_emp.lstrip('0'), f"E{target_emp.lstrip('0').zfill(4)}"))
+        elif action in ['reject', 'cancel', 'remove', 'revoke'] and not is_non_deductible and old_status == 'Approved':
             cur.execute("""
                 UPDATE leave_balances
                 SET used_days = GREATEST(0.0, used_days - %s),
                     remaining_days = remaining_days + %s,
                     updated_at = NOW()
-                WHERE employee_id = %s OR employee_id = %s;
-            """, (days, days, target_emp, target_emp.lstrip('0')))
+                WHERE employee_id = %s OR employee_id = %s OR employee_id = %s;
+            """, (days, days, target_emp, target_emp.lstrip('0'), f"E{target_emp.lstrip('0').zfill(4)}"))
 
         conn.commit()
         cur.close()
@@ -3028,6 +3023,136 @@ def review_team_leave(leave_id):
         return jsonify({
             'success': True,
             'status': new_status,
+            'message': 'Approved leave cancelled and balance restored successfully.' if action in ['cancel', 'remove', 'revoke'] else f'Leave {action}d successfully.',
+            'leave': dict(updated_leave)
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/leaves/<int:leave_id>/withdraw', methods=['POST'])
+@token_required
+def withdraw_leave(leave_id):
+    caller_emp_id = str(request.user.get('emp_id') or request.user.get('id') or '').strip()
+    data = request.get_json(silent=True) or {}
+    reason = (data.get('reason') or data.get('note') or 'Withdrawn by Employee').strip()
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        cur.execute("SELECT * FROM leaves WHERE id = %s;", (leave_id,))
+        leave_row = cur.fetchone()
+
+        if not leave_row:
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Leave request not found'}), 404
+
+        leave_emp_id = str(leave_row.get('employee_id') or '').strip()
+        current_status = str(leave_row.get('status') or '').strip()
+
+        # Check caller identity
+        caller = get_user_by_identifier(None, caller_emp_id)
+        users_map = load_monarch_users_map()
+        target_user = users_map.get(leave_emp_id) or users_map.get(leave_emp_id.lstrip('0')) or {}
+        is_owner = (caller_emp_id == leave_emp_id) or (caller_emp_id.lstrip('0') == leave_emp_id.lstrip('0'))
+        is_direct_mgr = is_direct_reporting_manager(caller, target_user)
+        caller_role = normalize_role(caller.get('role') if caller else request.user.get('role'))
+
+        if not (is_owner or is_direct_mgr or caller_role in ['admin', 'superadmin', 'director']):
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Forbidden: You can only withdraw your own leave requests.'}), 403
+
+        if current_status.lower() in ['withdrawn', 'cancelled']:
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'This leave request has already been withdrawn or cancelled.'}), 400
+
+        if current_status.lower() == 'rejected':
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Cannot withdraw a rejected leave request.'}), 400
+
+        # If already approved:
+        if current_status.lower() == 'approved':
+            # Regular employee CANNOT withdraw an approved leave directly
+            if is_owner and not (is_direct_mgr or caller_role in ['admin', 'superadmin', 'director']):
+                cur.close()
+                conn.close()
+                return jsonify({
+                    'error': 'This leave has already been approved. Approved leaves can only be cancelled or removed by your Reporting Manager.'
+                }), 400
+
+            # Reporting manager / admin cancelling approved leave
+            new_status = 'Cancelled'
+            cur.execute("""
+                UPDATE leaves
+                SET status = %s,
+                    reviewed_by = %s,
+                    reviewed_at = NOW(),
+                    rejection_reason = %s
+                WHERE id = %s
+                RETURNING *;
+            """, (new_status, (caller.get('name') if caller else None) or caller_emp_id, reason, leave_id))
+            updated_leave = cur.fetchone()
+
+            # Restore leave balance
+            leave_type_lower = str(leave_row.get('leave_type') or '').strip().lower()
+            is_non_deductible = any(nd in leave_type_lower for nd in ['loss of pay', 'lop', 'unpaid', 'regulariz', 'comp - off', 'comp-off', 'compoff', 'work from home', 'wfh'])
+            if not is_non_deductible:
+                days = float(leave_row.get('days_count') or 1.0)
+                cur.execute("""
+                    UPDATE leave_balances
+                    SET used_days = GREATEST(0.0, used_days - %s),
+                        remaining_days = remaining_days + %s,
+                        updated_at = NOW()
+                    WHERE employee_id = %s OR employee_id = %s OR employee_id = %s;
+                """, (days, days, leave_emp_id, leave_emp_id.lstrip('0'), f"E{leave_emp_id.lstrip('0').zfill(4)}"))
+
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            if updated_leave.get('start_date') and hasattr(updated_leave['start_date'], 'isoformat'): updated_leave['start_date'] = updated_leave['start_date'].isoformat()
+            if updated_leave.get('end_date') and hasattr(updated_leave['end_date'], 'isoformat'): updated_leave['end_date'] = updated_leave['end_date'].isoformat()
+            if updated_leave.get('applied_at') and hasattr(updated_leave['applied_at'], 'isoformat'): updated_leave['applied_at'] = updated_leave['applied_at'].isoformat()
+            if updated_leave.get('reviewed_at') and hasattr(updated_leave['reviewed_at'], 'isoformat'): updated_leave['reviewed_at'] = updated_leave['reviewed_at'].isoformat()
+
+            return jsonify({
+                'success': True,
+                'status': new_status,
+                'message': 'Approved leave cancelled and balance restored successfully.',
+                'leave': dict(updated_leave)
+            })
+
+        # Pending leave withdrawal:
+        new_status = 'Withdrawn'
+        cur.execute("""
+            UPDATE leaves
+            SET status = %s,
+                reviewed_by = %s,
+                reviewed_at = NOW(),
+                rejection_reason = %s
+            WHERE id = %s
+            RETURNING *;
+        """, (new_status, (caller.get('name') if caller else None) or (f"Withdrawn by {caller_emp_id}" if is_owner else caller_emp_id), reason, leave_id))
+        updated_leave = cur.fetchone()
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        if updated_leave.get('start_date') and hasattr(updated_leave['start_date'], 'isoformat'): updated_leave['start_date'] = updated_leave['start_date'].isoformat()
+        if updated_leave.get('end_date') and hasattr(updated_leave['end_date'], 'isoformat'): updated_leave['end_date'] = updated_leave['end_date'].isoformat()
+        if updated_leave.get('applied_at') and hasattr(updated_leave['applied_at'], 'isoformat'): updated_leave['applied_at'] = updated_leave['applied_at'].isoformat()
+        if updated_leave.get('reviewed_at') and hasattr(updated_leave['reviewed_at'], 'isoformat'): updated_leave['reviewed_at'] = updated_leave['reviewed_at'].isoformat()
+
+        return jsonify({
+            'success': True,
+            'status': new_status,
+            'message': 'Leave request withdrawn successfully.',
             'leave': dict(updated_leave)
         })
     except Exception as e:
@@ -4714,7 +4839,7 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
                         order_params = [single_word, f"{single_word}%", f"%{single_word}%", f"{single_word}%"]
 
             if dept:
-                conditions.append("department = %s")
+                conditions.append("LOWER(TRIM(department)) = LOWER(TRIM(%s))")
                 params.append(dept)
 
             if status == 'active':
@@ -4764,12 +4889,28 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
                     'employment_status': r.get('employment_status') or ('Active' if r.get('is_active', True) else 'Inactive')
                 })
 
+            # Fetch distinct departments for dynamic filters
+            cur.execute("""
+                SELECT DISTINCT TRIM(department) AS name
+                FROM data.users
+                WHERE department IS NOT NULL AND TRIM(department) != ''
+                ORDER BY TRIM(department) ASC;
+            """)
+            dept_rows = cur.fetchall()
+            all_depts = []
+            for r in dept_rows:
+                dn = re.sub(r'\s+', ' ', (r['name'] or '').strip())
+                if dn and dn not in all_depts:
+                    all_depts.append(dn)
+            all_depts.sort(key=lambda s: s.lower())
+
             return jsonify({
                 'employees': employees,
                 'total': total_count,
                 'page': page,
                 'limit': limit,
-                'pages': math.ceil(total_count / limit) if total_count > 0 else 1
+                'pages': math.ceil(total_count / limit) if total_count > 0 else 1,
+                'departments': all_depts
             })
 
         except Exception as e:
@@ -4863,6 +5004,41 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
         finally:
             if conn:
                 cur.close()
+    @app.route('/api/admin/departments', methods=['GET'])
+    @app.route('/api/departments', methods=['GET'])
+    @token_required
+    def get_admin_departments():
+        """Returns sorted list of distinct departments across the company."""
+        conn = None
+        try:
+            conn = get_monarch_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT DISTINCT TRIM(department) AS name, COUNT(*) AS count
+                FROM data.users
+                WHERE department IS NOT NULL AND TRIM(department) != ''
+                GROUP BY TRIM(department)
+                ORDER BY TRIM(department) ASC;
+            """)
+            rows = cur.fetchall()
+            depts = []
+            for r in rows:
+                raw_name = (r['name'] or '').strip()
+                clean_name = re.sub(r'\s+', ' ', raw_name)
+                if clean_name and clean_name not in depts:
+                    depts.append(clean_name)
+            depts.sort(key=lambda s: s.lower())
+            return jsonify({
+                'departments': depts,
+                'count': len(depts)
+            })
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+        finally:
+            if conn:
+                cur.close()
+                conn.close()
+
     @app.route('/api/admin/reporting-managers', methods=['GET'])
     @token_required
     def get_admin_reporting_managers():
@@ -5857,7 +6033,7 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
                     FROM data.leaves
                     WHERE employee_id = ANY(%s)
                       AND start_date <= %s AND end_date >= %s
-                      AND status NOT ILIKE '%%reject%%'
+                      AND status NOT ILIKE '%%reject%%' AND status NOT ILIKE '%%withdrawn%%' AND status NOT ILIKE '%%cancel%%'
                     ORDER BY CASE WHEN status ILIKE '%%approved%%' THEN 1 WHEN status ILIKE '%%pending%%' THEN 2 ELSE 3 END, id DESC;
                 """, (emp_id_variants, end_dt, start_dt))
                 for lr in cur.fetchall():
@@ -6644,8 +6820,8 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
         action = (data.get('action') or 'approve').strip().lower()
         reason = (data.get('reason') or data.get('rejection_reason') or '').strip()
 
-        if action not in ['approve', 'reject']:
-            return jsonify({'error': "Action must be 'approve' or 'reject'"}), 400
+        if action not in ['approve', 'reject', 'cancel', 'remove', 'revoke']:
+            return jsonify({'error': "Action must be 'approve', 'reject', or 'cancel'"}), 400
 
         conn = None
         try:
@@ -6688,16 +6864,17 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
 
                 audit_action = 'LEAVE_APPROVE'
 
-            else:  # reject
-                new_status = 'Rejected'
+            else:  # reject or cancel
+                new_status = 'Cancelled' if action in ['cancel', 'remove', 'revoke'] else 'Rejected'
+                c_reason = reason or ('Cancelled by Admin' if action in ['cancel', 'remove', 'revoke'] else None)
                 cur.execute("""
                     UPDATE data.leaves
-                    SET status = 'Rejected',
+                    SET status = %s,
                         reviewed_by = %s,
                         reviewed_at = NOW(),
                         rejection_reason = %s
                     WHERE id = %s;
-                """, (request.user.get('name'), reason, leave_id))
+                """, (new_status, request.user.get('name'), c_reason, leave_id))
 
                 leave_type_lower = str(leave_req.get('leave_type') or '').strip().lower()
                 is_non_deductible = any(nd in leave_type_lower for nd in ['loss of pay', 'lop', 'unpaid', 'regulariz', 'comp - off', 'comp-off', 'compoff', 'work from home', 'wfh'])
@@ -7219,7 +7396,8 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
                        clock_in_lat, clock_in_lng,
                        clock_out_lat, clock_out_lng,
                        clock_out_in_geofence, clock_out_distance_meters,
-                       created_at
+                       created_at,
+                       vehicle_photo_in, vehicle_photo_out
                 FROM data.attendance
                 WHERE date = %s
                 ORDER BY id DESC;
@@ -7284,7 +7462,8 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
                         'nearest_building': in_geo['nearest_building'],
                         'distance_meters': in_geo['distance_meters'],
                         'location_note': f"{in_geo['distance_meters']}m from {in_geo['nearest_building']}",
-                        'source': 'Mobile Phone (GPS)'
+                        'source': 'Mobile Phone (GPS)',
+                        'vehicle_photo': p.get('vehicle_photo_in')
                     }
                     events.append(phone_in_obj)
 
@@ -7329,7 +7508,8 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
                         'nearest_building': out_geo['nearest_building'],
                         'distance_meters': out_geo['distance_meters'],
                         'location_note': f"{out_geo['distance_meters']}m from {out_geo['nearest_building']}",
-                        'source': 'Mobile Phone (GPS)'
+                        'source': 'Mobile Phone (GPS)',
+                        'vehicle_photo': p.get('vehicle_photo_out')
                     }
                     events.append(phone_out_obj)
 
@@ -7367,6 +7547,8 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
                     'raw_location': p.get('location'),
                     'sign_in': str(p['sign_in'])[:8] if p.get('sign_in') else None,
                     'sign_out': str(p['sign_out'])[:8] if p.get('sign_out') else None,
+                    'vehicle_photo_in': p.get('vehicle_photo_in'),
+                    'vehicle_photo_out': p.get('vehicle_photo_out'),
                 })
 
             return jsonify({
@@ -7864,7 +8046,7 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
                         FROM data.leaves
                         WHERE employee_id = ANY(%s)
                           AND start_date <= %s AND end_date >= %s
-                          AND status NOT ILIKE '%%reject%%'
+                          AND status NOT ILIKE '%%reject%%' AND status NOT ILIKE '%%withdrawn%%' AND status NOT ILIKE '%%cancel%%'
                         ORDER BY CASE WHEN status ILIKE '%%approved%%' THEN 1 WHEN status ILIKE '%%pending%%' THEN 2 ELSE 3 END, id DESC;
                     """, (emp_id_variants, end_dt, start_dt))
                     for lr in cur.fetchall():
@@ -8858,8 +9040,36 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
                 <i data-lucide="x" style="width: 14px; height: 14px;"></i>
               </button>
             </div>
-            <select id="emp-dept-filter" class="form-control" style="width: 200px;" onchange="loadEmployees(1)">
+            <select id="emp-dept-filter" class="form-control" style="width: 215px;" onchange="loadEmployees(1)">
               <option value="">All Departments</option>
+              <option value="Admin">Admin</option>
+              <option value="Administration">Administration</option>
+              <option value="AI & Software Engineering">AI & Software Engineering</option>
+              <option value="CAD">CAD</option>
+              <option value="Drone">Drone</option>
+              <option value="Engineering Department">Engineering Department</option>
+              <option value="Field COE">Field COE</option>
+              <option value="Finance & Accounts">Finance & Accounts</option>
+              <option value="Gati Shakti -Project">Gati Shakti -Project</option>
+              <option value="Geospatial Technology">Geospatial Technology</option>
+              <option value="Geotech">Geotech</option>
+              <option value="GIS">GIS</option>
+              <option value="Highway Engineering">Highway Engineering</option>
+              <option value="HR">HR</option>
+              <option value="HR & Admin">HR & Admin</option>
+              <option value="IT Department">IT Department</option>
+              <option value="LAQ">LAQ</option>
+              <option value="LAQ Shaktipeeth">LAQ Shaktipeeth</option>
+              <option value="Licensed Surveyor">Licensed Surveyor</option>
+              <option value="Local MOD">Local MOD</option>
+              <option value="Management">Management</option>
+              <option value="Procurement">Procurement</option>
+              <option value="Project">Project</option>
+              <option value="Projects">Projects</option>
+              <option value="Railway Engineering">Railway Engineering</option>
+              <option value="Sales & BD">Sales & BD</option>
+              <option value="Traffic & Safety">Traffic & Safety</option>
+              <option value="Urban Planner">Urban Planner</option>
             </select>
             <select id="emp-status-filter" class="form-control" style="width: 140px;" onchange="loadEmployees(1)">
               <option value="active">Active Only</option>
@@ -8918,7 +9128,38 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
           <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
             <input type="date" id="att-date-picker" class="form-control" style="width: 160px;" onchange="loadAttendanceRecords(1)">
             <input type="text" id="att-search-input" class="form-control" style="width: 220px;" placeholder="Search employee..." oninput="handleAttendanceSearch(event)" onkeydown="if(event.key==='Enter') handleAttendanceSearch(event)">
-            <select id="att-status-filter" class="form-control" style="width: 150px;" onchange="loadAttendanceRecords(1)">
+            <select id="att-dept-filter" class="form-control" style="width: 180px;" onchange="loadAttendanceRecords(1)">
+              <option value="">All Departments</option>
+              <option value="Admin">Admin</option>
+              <option value="Administration">Administration</option>
+              <option value="AI & Software Engineering">AI & Software Engineering</option>
+              <option value="CAD">CAD</option>
+              <option value="Drone">Drone</option>
+              <option value="Engineering Department">Engineering Department</option>
+              <option value="Field COE">Field COE</option>
+              <option value="Finance & Accounts">Finance & Accounts</option>
+              <option value="Gati Shakti -Project">Gati Shakti -Project</option>
+              <option value="Geospatial Technology">Geospatial Technology</option>
+              <option value="Geotech">Geotech</option>
+              <option value="GIS">GIS</option>
+              <option value="Highway Engineering">Highway Engineering</option>
+              <option value="HR">HR</option>
+              <option value="HR & Admin">HR & Admin</option>
+              <option value="IT Department">IT Department</option>
+              <option value="LAQ">LAQ</option>
+              <option value="LAQ Shaktipeeth">LAQ Shaktipeeth</option>
+              <option value="Licensed Surveyor">Licensed Surveyor</option>
+              <option value="Local MOD">Local MOD</option>
+              <option value="Management">Management</option>
+              <option value="Procurement">Procurement</option>
+              <option value="Project">Project</option>
+              <option value="Projects">Projects</option>
+              <option value="Railway Engineering">Railway Engineering</option>
+              <option value="Sales & BD">Sales & BD</option>
+              <option value="Traffic & Safety">Traffic & Safety</option>
+              <option value="Urban Planner">Urban Planner</option>
+            </select>
+            <select id="att-status-filter" class="form-control" style="width: 140px;" onchange="loadAttendanceRecords(1)">
               <option value="all">All Statuses</option>
               <option value="present">Present</option>
               <option value="late">Late</option>
@@ -10351,6 +10592,33 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <!-- Audit Trail Record Diff Details Modal -->
+  <div class="modal-backdrop" id="modal-audit-diff">
+    <div class="modal-card" style="max-width: 860px; max-height: 90vh; display: flex; flex-direction: column;">
+      <div style="padding: 18px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; background: #FAFBFD; border-radius: 16px 16px 0 0;">
+        <div style="display: flex; align-items: center; gap: 12px;">
+          <div style="width: 38px; height: 38px; border-radius: 10px; background: #FFF7ED; border: 1px solid #FFEDD5; display: flex; align-items: center; justify-content: center; color: var(--primary);">
+            <i data-lucide="git-commit" style="width: 20px; height: 20px;"></i>
+          </div>
+          <div>
+            <h3 style="font-size: 16px; font-weight: 800; color: #0F172A; margin: 0;">Audit Record Comparison & Diff</h3>
+            <p style="font-size: 12px; color: var(--text-muted); margin: 2px 0 0;" id="audit-modal-subtitle">Detailed before & after state comparison</p>
+          </div>
+        </div>
+        <button onclick="closeModal('modal-audit-diff')" style="background: transparent; border: none; font-size: 24px; cursor: pointer; color: var(--text-muted); line-height: 1;">&times;</button>
+      </div>
+
+      <div style="padding: 24px; overflow-y: auto; flex: 1;" id="audit-modal-content">
+        <!-- Dynamically rendered -->
+      </div>
+
+      <div style="padding: 14px 24px; border-top: 1px solid var(--border); background: #FAFBFD; display: flex; justify-content: space-between; align-items: center; border-radius: 0 0 16px 16px;">
+        <div id="audit-modal-footer-info" style="font-size: 11.5px; color: var(--text-muted);"></div>
+        <button class="btn btn-outline btn-sm" onclick="closeModal('modal-audit-diff')">Close Window</button>
+      </div>
+    </div>
+  </div>
+
   <!-- ═════════════════ DEDICATED FULL-SCREEN LOGIN PAGE ═════════════════ -->
   <div id="login-page">
     <!-- Left Hero Pane -->
@@ -10507,7 +10775,10 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
     function togglePasswordVisibility() {
       const inp = document.getElementById('login-password');
       if (!inp) return;
+      const s = inp.selectionStart;
+      const e = inp.selectionEnd;
       inp.type = (inp.type === 'password') ? 'text' : 'password';
+      try { inp.setSelectionRange(s, e); } catch (_) {}
     }
 
     // Initializer
@@ -10522,6 +10793,7 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
       } else {
         hideLoginPage();
         updateUserInfoDisplay();
+        loadDepartmentFilter();
         switchTab('dashboard');
       }
     });
@@ -10834,6 +11106,61 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
       });
     }
 
+    // ─── Department Filter Loader ──────────────────────────────────────────
+    async function loadDepartmentFilter() {
+      if (window._departmentsCache && window._departmentsCache.length > 0) {
+        populateDeptSelectElements(window._departmentsCache);
+        return;
+      }
+      try {
+        const res = await fetch('/api/admin/departments', {
+          headers: { 'Authorization': `Bearer ${state.token}` }
+        });
+        const d = await res.json();
+        if (d && d.departments && Array.isArray(d.departments) && d.departments.length > 0) {
+          window._departmentsCache = d.departments;
+          populateDeptSelectElements(d.departments);
+        }
+      } catch (err) {
+        console.warn('Failed to load departments:', err);
+      }
+    }
+
+    function populateDeptSelectElements(depts) {
+      if (!depts || depts.length === 0) return;
+      window._departmentsCache = depts;
+
+      const selects = [
+        document.getElementById('emp-dept-filter'),
+        document.getElementById('att-dept-filter')
+      ].filter(Boolean);
+
+      selects.forEach(selectEl => {
+        const currentVal = selectEl.value;
+        let html = '<option value="">All Departments</option>';
+        depts.forEach(dn => {
+          html += `<option value="${escapeHtml(dn)}">${escapeHtml(dn)}</option>`;
+        });
+        selectEl.innerHTML = html;
+        if (currentVal) {
+          selectEl.value = currentVal;
+        }
+      });
+
+      // Also attach datalist to modal inputs
+      let dl = document.getElementById('dl-departments');
+      if (!dl) {
+        dl = document.createElement('datalist');
+        dl.id = 'dl-departments';
+        document.body.appendChild(dl);
+      }
+      dl.innerHTML = depts.map(dn => `<option value="${escapeHtml(dn)}">`).join('');
+      const inpDept = document.getElementById('inp-emp-dept');
+      if (inpDept) inpDept.setAttribute('list', 'dl-departments');
+      const editDept = document.getElementById('edit-emp-dept');
+      if (editDept) editDept.setAttribute('list', 'dl-departments');
+    }
+
     // ─── 2. Employees Module Logic ──────────────────────────────────────────
     async function loadEmployees(page = 1) {
       state.empPage = page;
@@ -10846,6 +11173,9 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
           headers: { 'Authorization': `Bearer ${state.token}` }
         });
         const d = await res.json();
+        if (d.departments && Array.isArray(d.departments) && d.departments.length > 0) {
+          populateDeptSelectElements(d.departments);
+        }
         const tb = document.getElementById('table-employees-body');
 
         if (!d.employees || d.employees.length === 0) {
@@ -11311,13 +11641,14 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
       state.attPage = page;
       const date = document.getElementById('att-date-picker').value;
       const search = document.getElementById('att-search-input').value.trim();
+      const dept = document.getElementById('att-dept-filter')?.value || '';
       const status = document.getElementById('att-status-filter').value;
       const kpiFilter = state.dailyKpiFilter || 'all';
 
       updateDailyFilterCardStyles();
 
       try {
-        const res = await fetch(`/api/admin/attendance-records?date=${date}&page=${page}&limit=25&search=${encodeURIComponent(search)}&status=${status}&kpi_filter=${kpiFilter}`, {
+        const res = await fetch(`/api/admin/attendance-records?date=${date}&page=${page}&limit=25&search=${encodeURIComponent(search)}&department=${encodeURIComponent(dept)}&status=${status}&kpi_filter=${kpiFilter}`, {
           headers: { 'Authorization': `Bearer ${state.token}` }
         });
         const d = await res.json();
@@ -12909,6 +13240,16 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
               <div style="margin-top: 4px; font-size: 10.5px; color: #64748B;">GPS: ${ev.latitude.toFixed(6)}, ${ev.longitude.toFixed(6)}</div>
             </div>
 
+            ${ev.vehicle_photo ? `
+              <div style="margin: 8px 0; text-align: center;">
+                <div style="font-size: 11px; font-weight: 700; color: #475569; margin-bottom: 4px; display: flex; align-items: center; justify-content: space-between;">
+                  <span>🚗 Vehicle Photo</span>
+                  <span style="font-size: 10px; color: #0284C7; cursor: pointer;" onclick="viewVehiclePhoto('${escapeHtml(ev.employee_name)} - ${escapeHtml(ev.punch_label)}', '${ev.vehicle_photo}')">Expand ↗</span>
+                </div>
+                <img src="${ev.vehicle_photo}" alt="Vehicle" style="width: 100%; max-height: 140px; object-fit: cover; border-radius: 8px; border: 1px solid #CBD5E1; cursor: pointer; box-shadow: 0 1px 3px rgba(0,0,0,0.1);" onclick="viewVehiclePhoto('${escapeHtml(ev.employee_name)} - ${escapeHtml(ev.punch_label)}', '${ev.vehicle_photo}')" title="Click to view full photo" />
+              </div>
+            ` : ''}
+
             <a href="https://www.google.com/maps?q=${ev.latitude},${ev.longitude}" target="_blank" class="btn btn-secondary btn-sm" style="width: 100%; justify-content: center; font-size: 11.5px; padding: 5px 8px;">
               View on Google Maps ↗
             </a>
@@ -13008,13 +13349,18 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
               <div style="color: #047857; margin-top: 2px; font-size: 10.5px;">
                 Near ${escapeHtml(emp.phone_in.nearest_building)} (${emp.phone_in.distance_meters}m)
               </div>
-              <div style="display: flex; gap: 6px; margin-top: 5px;">
+              <div style="display: flex; gap: 6px; margin-top: 5px; align-items: center; flex-wrap: wrap;">
                 <button class="btn btn-secondary btn-sm" onclick="focusGpsEvent('${emp.phone_in.event_id}')" style="padding: 2px 8px; font-size: 10px;">
                   📍 Zoom Check-In Pin
                 </button>
                 <a href="https://www.google.com/maps?q=${emp.phone_in.latitude},${emp.phone_in.longitude}" target="_blank" class="btn btn-secondary btn-sm" style="padding: 2px 8px; font-size: 10px;">
                   Map ↗
                 </a>
+                ${emp.phone_in.vehicle_photo ? `
+                  <button class="btn btn-sm" onclick="viewVehiclePhoto('${escapeHtml(emp.employee_name)} Check-In Photo', '${emp.phone_in.vehicle_photo}')" style="padding: 2px 8px; font-size: 10px; background: #FEF3C7; color: #92400E; border: 1px solid #FCD34D; font-weight: 700; border-radius: 6px; display: inline-flex; align-items: center; gap: 3px; cursor: pointer;" title="View vehicle photo">
+                    🚗 Vehicle Photo
+                  </button>
+                ` : ''}
               </div>
             </div>
           `;
@@ -13032,13 +13378,18 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
               <div style="color: #1D4ED8; margin-top: 2px; font-size: 10.5px;">
                 Near ${escapeHtml(emp.phone_out.nearest_building)} (${emp.phone_out.distance_meters}m)
               </div>
-              <div style="display: flex; gap: 6px; margin-top: 5px;">
+              <div style="display: flex; gap: 6px; margin-top: 5px; align-items: center; flex-wrap: wrap;">
                 <button class="btn btn-secondary btn-sm" onclick="focusGpsEvent('${emp.phone_out.event_id}')" style="padding: 2px 8px; font-size: 10px;">
                   📍 Zoom Check-Out Pin
                 </button>
                 <a href="https://www.google.com/maps?q=${emp.phone_out.latitude},${emp.phone_out.longitude}" target="_blank" class="btn btn-secondary btn-sm" style="padding: 2px 8px; font-size: 10px;">
                   Map ↗
                 </a>
+                ${emp.phone_out.vehicle_photo ? `
+                  <button class="btn btn-sm" onclick="viewVehiclePhoto('${escapeHtml(emp.employee_name)} Check-Out Photo', '${emp.phone_out.vehicle_photo}')" style="padding: 2px 8px; font-size: 10px; background: #DBEAFE; color: #1E40AF; border: 1px solid #93C5FD; font-weight: 700; border-radius: 6px; display: inline-flex; align-items: center; gap: 3px; cursor: pointer;" title="View vehicle photo">
+                    🚗 Vehicle Photo
+                  </button>
+                ` : ''}
               </div>
             </div>
           `;
@@ -13070,6 +13421,35 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
           </div>
         `;
       }).join('');
+    }
+
+    function viewVehiclePhoto(title, photoUrl) {
+      if (!photoUrl) return;
+      let modal = document.getElementById('vehicle-photo-modal');
+      if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'vehicle-photo-modal';
+        modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:999999;display:flex;align-items:center;justify-content:center;padding:20px;';
+        modal.onclick = (e) => { if (e.target === modal) modal.style.display = 'none'; };
+        modal.innerHTML = `
+          <div style="background:#fff;border-radius:14px;max-width:540px;width:100%;overflow:hidden;box-shadow:0 20px 25px -5px rgba(0,0,0,0.4);">
+            <div style="padding:12px 16px;border-bottom:1px solid #E2E8F0;display:flex;align-items:center;justify-content:space-between;background:#F8FAFC;">
+              <div id="vphoto-title" style="font-weight:700;font-size:13.5px;color:#0F172A;">🚗 Vehicle Photo</div>
+              <button onclick="document.getElementById('vehicle-photo-modal').style.display='none'" style="background:none;border:none;font-size:22px;cursor:pointer;color:#64748B;line-height:1;">&times;</button>
+            </div>
+            <div style="padding:16px;text-align:center;background:#0F172A;">
+              <img id="vphoto-img" src="" alt="Vehicle" style="max-width:100%;max-height:75vh;border-radius:8px;object-fit:contain;box-shadow:0 4px 12px rgba(0,0,0,0.3);" />
+            </div>
+            <div style="padding:10px 16px;background:#F8FAFC;border-top:1px solid #E2E8F0;display:flex;justify-content:flex-end;">
+              <button class="btn btn-secondary btn-sm" onclick="document.getElementById('vehicle-photo-modal').style.display='none'">Close</button>
+            </div>
+          </div>
+        `;
+        document.body.appendChild(modal);
+      }
+      document.getElementById('vphoto-title').innerText = title || '🚗 Vehicle Photo';
+      document.getElementById('vphoto-img').src = photoUrl;
+      modal.style.display = 'flex';
     }
 
     function focusGpsEvent(eventId) {
@@ -13254,7 +13634,7 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
       }
     }
 
-    // ─── 9. Audit Logs Module Logic ──────────────────────────────────────────
+    // ─── 9. Audit Logs Module Logic & Detailed Diff Inspector ──────────────────
     async function loadAuditLogs() {
       try {
         const res = await fetch('/api/admin/audit-logs', {
@@ -13267,28 +13647,440 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
           return;
         }
 
-        tb.innerHTML = logs.map(l => `
-          <tr>
-            <td style="font-size: 12px; color: var(--text-muted);">${l.timestamp.replace('T', ' ').substring(0, 19)}</td>
-            <td>
-              <div style="font-weight: 700; color: #0F172A;">${escapeHtml(l.actor_name)}</div>
-              <div style="font-size: 11px; color: var(--text-muted);">#${l.actor_id} • ${l.ip_address}</div>
-            </td>
-            <td><span class="badge badge-blue">${l.action}</span></td>
-            <td>${l.target_type} #${l.target_id || '--'}</td>
-            <td>${escapeHtml(l.reason || 'Administrative Action')}</td>
-            <td>
-              <button class="btn btn-outline btn-sm" onclick='viewAuditDiff(${JSON.stringify(l.before_value)}, ${JSON.stringify(l.after_value)})'>View Diff</button>
-            </td>
-          </tr>
-        `).join('');
+        state.auditLogsCache = logs;
+
+        tb.innerHTML = logs.map(l => {
+          const summary = getAuditDiffSummary(l.before_value, l.after_value);
+          const badgeClass = getAuditActionBadge(l.action);
+
+          return `
+            <tr>
+              <td style="font-size: 12px; color: var(--text-muted); white-space: nowrap;">
+                <div style="font-weight: 700; color: #0F172A;">${formatAuditTimestamp(l.timestamp)}</div>
+                <div style="font-size: 11px; color: #64748B;">${timeAgo(l.timestamp)}</div>
+              </td>
+              <td>
+                <div style="font-weight: 700; color: #0F172A;">${escapeHtml(l.actor_name || 'Administrator')}</div>
+                <div style="font-size: 11px; color: var(--text-muted);">EMP #${l.actor_id} • IP: ${escapeHtml(l.ip_address || '127.0.0.1')}</div>
+              </td>
+              <td>
+                <span class="badge ${badgeClass}" style="font-weight: 700;">${escapeHtml(l.action)}</span>
+              </td>
+              <td>
+                <div style="font-weight: 600; color: #1E293B;">${escapeHtml(l.target_type)}</div>
+                <div style="font-size: 11.5px; color: var(--primary); font-weight: 700;">#${escapeHtml(l.target_id || '--')}</div>
+              </td>
+              <td style="max-width: 250px;">
+                <div style="font-size: 12px; color: #334155; line-height: 1.4; word-break: break-word;">
+                  ${escapeHtml(l.reason || 'Administrative Action')}
+                </div>
+              </td>
+              <td>
+                <div style="display: flex; align-items: center; gap: 8px;">
+                  <button class="btn btn-primary btn-sm" onclick="openAuditDiffModal(${l.id})" style="padding: 5px 12px; font-size: 12px; font-weight: 600; display: inline-flex; align-items: center; gap: 5px;">
+                    <i data-lucide="eye" style="width: 13px; height: 13px;"></i>
+                    <span>Inspect Diff</span>
+                  </button>
+                  ${summary.pillHtml}
+                </div>
+              </td>
+            </tr>
+          `;
+        }).join('');
+
+        if (window.lucide) lucide.createIcons();
       } catch (err) {
         console.error('Error loading audit trail:', err);
       }
     }
 
-    function viewAuditDiff(before, after) {
-      alert(`AUDIT RECORD DIFF:\n\nBEFORE:\n${JSON.stringify(before, null, 2)}\n\nAFTER:\n${JSON.stringify(after, null, 2)}`);
+    function getAuditActionBadge(action) {
+      const a = (action || '').toUpperCase();
+      if (a.includes('APPROVE') || a.includes('CONFIRM') || a.includes('ACTIVATE') || a.includes('CREATE')) return 'badge-green';
+      if (a.includes('REJECT') || a.includes('DEACTIVATE') || a.includes('DELETE')) return 'badge-red';
+      if (a.includes('UPDATE') || a.includes('CORRECT') || a.includes('EDIT') || a.includes('OVERRIDE')) return 'badge-amber';
+      return 'badge-blue';
+    }
+
+    function formatAuditTimestamp(ts) {
+      if (!ts) return '--';
+      try {
+        const d = new Date(ts);
+        if (isNaN(d.getTime())) return String(ts).replace('T', ' ').substring(0, 19);
+        return d.toLocaleString('en-IN', {
+          day: '2-digit',
+          month: 'short',
+          year: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: true
+        });
+      } catch (_) {
+        return String(ts).replace('T', ' ').substring(0, 19);
+      }
+    }
+
+    function timeAgo(dateParam) {
+      if (!dateParam) return '';
+      const date = typeof dateParam === 'object' ? dateParam : new Date(dateParam);
+      const today = new Date();
+      const seconds = Math.round((today - date) / 1000);
+      if (seconds < 60) return 'just now';
+      const minutes = Math.round(seconds / 60);
+      if (minutes < 60) return `${minutes}m ago`;
+      const hours = Math.round(minutes / 60);
+      if (hours < 24) return `${hours}h ago`;
+      const days = Math.round(hours / 24);
+      if (days < 30) return `${days}d ago`;
+      return `${Math.round(days / 30)}mo ago`;
+    }
+
+    function getAuditDiffSummary(before, after) {
+      const b = (before && typeof before === 'object') ? before : {};
+      const a = (after && typeof after === 'object') ? after : {};
+      
+      const bKeys = Object.keys(b);
+      const aKeys = Object.keys(a);
+
+      if (bKeys.length === 0 && aKeys.length > 0) {
+        return {
+          pillHtml: '<span class="badge badge-green" style="font-size: 10px; font-weight: 700;">Created</span>',
+          changedCount: aKeys.length
+        };
+      }
+      if (aKeys.length === 0 && bKeys.length > 0) {
+        return {
+          pillHtml: '<span class="badge badge-red" style="font-size: 10px; font-weight: 700;">Deleted</span>',
+          changedCount: bKeys.length
+        };
+      }
+
+      let changedCount = 0;
+      const allKeys = new Set([...bKeys, ...aKeys]);
+      allKeys.forEach(k => {
+        if (JSON.stringify(b[k]) !== JSON.stringify(a[k])) {
+          changedCount++;
+        }
+      });
+
+      if (changedCount === 0) {
+        return {
+          pillHtml: '<span class="badge badge-gray" style="font-size: 10px;">No change</span>',
+          changedCount: 0
+        };
+      }
+      return {
+        pillHtml: `<span class="badge badge-amber" style="font-size: 10px; font-weight: 700;">${changedCount} ${changedCount === 1 ? 'change' : 'changes'}</span>`,
+        changedCount: changedCount
+      };
+    }
+
+    function formatFieldName(rawKey) {
+      const map = {
+        'name': 'Employee Name',
+        'full_name': 'Full Name',
+        'employee_no': 'Employee ID / Number',
+        'dept': 'Department',
+        'department': 'Department',
+        'desig': 'Designation',
+        'designation': 'Designation',
+        'reporting_manager': 'Reporting Manager',
+        'mgr': 'Reporting Manager',
+        'mobile_number': 'Mobile Number',
+        'phone_number': 'Mobile Number',
+        'personal_email': 'Email Address',
+        'email': 'Email Address',
+        'sign_in': 'Sign-In Punch',
+        'sign_out': 'Sign-Out Punch',
+        'in_geofence': 'In Geofence',
+        'work_hours': 'Work Hours',
+        'approval_status': 'Approval Status',
+        'status': 'Status',
+        'employment_status': 'Employment Status',
+        'is_active': 'Active Status',
+        'date_of_joining': 'Date of Joining',
+        'joining_date': 'Date of Joining',
+        'location': 'Location / Base',
+        'shift_timing': 'Shift Timing',
+        'weekly_off': 'Weekly Off',
+        'role': 'System Role',
+        'reviewer': 'Reviewer Name',
+        'leave_type': 'Leave Type',
+        'start_date': 'Start Date',
+        'end_date': 'End Date',
+        'total_days': 'Total Days',
+        'date': 'Attendance Date',
+        'punch_type': 'Punch Type'
+      };
+      if (map[rawKey]) return map[rawKey];
+      return rawKey.split('_').map(w => w ? (w.charAt(0).toUpperCase() + w.slice(1)) : '').join(' ');
+    }
+
+    function formatFieldValue(val) {
+      if (val === null || val === undefined) {
+        return '<span style="color: #94A3B8; font-style: italic;">null (empty)</span>';
+      }
+      if (typeof val === 'boolean') {
+        return val 
+          ? '<span class="badge badge-green" style="font-size: 11px;">TRUE / ACTIVE</span>'
+          : '<span class="badge badge-red" style="font-size: 11px;">FALSE / INACTIVE</span>';
+      }
+      if (typeof val === 'object') {
+        return `<code>${escapeHtml(JSON.stringify(val))}</code>`;
+      }
+      const s = String(val).trim();
+      if (s === '') return '<span style="color: #94A3B8; font-style: italic;">(blank)</span>';
+      return escapeHtml(s);
+    }
+
+    function openAuditDiffModal(logId) {
+      const log = (state.auditLogsCache || []).find(x => x.id === logId);
+      if (!log) {
+        alert('Audit log record #' + logId + ' not found in memory. Please refresh the trail.');
+        return;
+      }
+
+      showModal('modal-audit-diff');
+
+      const subtitleEl = document.getElementById('audit-modal-subtitle');
+      if (subtitleEl) {
+        subtitleEl.innerText = `Audit Event #${log.id} • ${log.action} on ${log.target_type} #${log.target_id || ''}`;
+      }
+
+      const footerEl = document.getElementById('audit-modal-footer-info');
+      if (footerEl) {
+        footerEl.innerHTML = `Audit ID: <strong>#${log.id}</strong> • Logged by <strong>${escapeHtml(log.actor_name || 'Admin')}</strong> (#${log.actor_id}) from IP <code>${escapeHtml(log.ip_address || '127.0.0.1')}</code> on ${formatAuditTimestamp(log.timestamp)}`;
+      }
+
+      const container = document.getElementById('audit-modal-content');
+      
+      const before = (log.before_value && typeof log.before_value === 'object') ? log.before_value : {};
+      const after = (log.after_value && typeof log.after_value === 'object') ? log.after_value : {};
+
+      const bKeys = Object.keys(before);
+      const aKeys = Object.keys(after);
+      const isInitialCreation = (bKeys.length === 0 && aKeys.length > 0);
+      const isDeletion = (aKeys.length === 0 && bKeys.length > 0);
+
+      const allKeys = Array.from(new Set([...bKeys, ...aKeys]));
+
+      // Identify modified, added, removed, and unchanged
+      const rows = [];
+      allKeys.forEach(k => {
+        const hasBefore = (k in before);
+        const hasAfter = (k in after);
+        const bVal = before[k];
+        const aVal = after[k];
+        const bStr = JSON.stringify(bVal);
+        const aStr = JSON.stringify(aVal);
+
+        if (isInitialCreation) {
+          rows.push({ key: k, type: 'ADDED', before: null, after: aVal, changed: true });
+        } else if (isDeletion) {
+          rows.push({ key: k, type: 'REMOVED', before: bVal, after: null, changed: true });
+        } else if (!hasBefore && hasAfter) {
+          rows.push({ key: k, type: 'ADDED', before: null, after: aVal, changed: true });
+        } else if (hasBefore && !hasAfter) {
+          rows.push({ key: k, type: 'REMOVED', before: bVal, after: null, changed: true });
+        } else if (bStr !== aStr) {
+          rows.push({ key: k, type: 'MODIFIED', before: bVal, after: aVal, changed: true });
+        } else {
+          rows.push({ key: k, type: 'UNCHANGED', before: bVal, after: aVal, changed: false });
+        }
+      });
+
+      // Sort: changed fields first, then unchanged
+      rows.sort((a, b) => {
+        if (a.changed && !b.changed) return -1;
+        if (!a.changed && b.changed) return 1;
+        return a.key.localeCompare(b.key);
+      });
+
+      const changedCount = rows.filter(r => r.changed).length;
+      const unchangedCount = rows.filter(r => !r.changed).length;
+      const actionBadgeClass = getAuditActionBadge(log.action);
+
+      container.innerHTML = `
+        <!-- Top Overview Metadata Grid -->
+        <div style="background: #F8FAFC; border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 20px;">
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px;">
+            <div>
+              <div style="font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase;">ADMINISTRATOR / ACTOR</div>
+              <div style="font-size: 14px; font-weight: 800; color: #0F172A; margin-top: 3px;">${escapeHtml(log.actor_name || 'Admin')}</div>
+              <div style="font-size: 11.5px; color: var(--text-muted);">EMP ID: #${log.actor_id}</div>
+            </div>
+
+            <div>
+              <div style="font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase;">ACTION EXECUTED</div>
+              <div style="margin-top: 4px;">
+                <span class="badge ${actionBadgeClass}" style="font-size: 12px; font-weight: 800; padding: 3px 10px;">${escapeHtml(log.action)}</span>
+              </div>
+            </div>
+
+            <div>
+              <div style="font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase;">TARGET RECORD</div>
+              <div style="font-size: 14px; font-weight: 800; color: #0F172A; margin-top: 3px;">${escapeHtml(log.target_type)}</div>
+              <div style="font-size: 11.5px; color: var(--primary); font-weight: 700;">Record ID: #${escapeHtml(log.target_id || '--')}</div>
+            </div>
+
+            <div>
+              <div style="font-size: 11px; font-weight: 700; color: var(--text-muted); text-transform: uppercase;">TIMESTAMP & IP</div>
+              <div style="font-size: 13px; font-weight: 700; color: #0F172A; margin-top: 3px;">${formatAuditTimestamp(log.timestamp)}</div>
+              <div style="font-size: 11.5px; color: var(--text-muted);">IP: <code>${escapeHtml(log.ip_address || '127.0.0.1')}</code></div>
+            </div>
+          </div>
+
+          <!-- Reason Callout -->
+          <div style="margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border); display: flex; align-items: flex-start; gap: 10px;">
+            <div style="width: 26px; height: 26px; border-radius: 6px; background: #FEF3C7; color: #D97706; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px;">
+              <i data-lucide="message-square" style="width: 15px; height: 15px;"></i>
+            </div>
+            <div>
+              <span style="font-size: 11.5px; font-weight: 800; color: #92400E; text-transform: uppercase; letter-spacing: 0.5px;">MANDATORY ADMINISTRATIVE REASON:</span>
+              <div style="font-size: 13px; font-weight: 600; color: #1E293B; margin-top: 2px;">
+                ${escapeHtml(log.reason || 'No specific reason provided for this administrative modification.')}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Diff Controls Bar -->
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; flex-wrap: wrap; gap: 10px;">
+          <div style="display: flex; align-items: center; gap: 10px;">
+            <div style="font-size: 14px; font-weight: 800; color: #0F172A;">
+              Change Breakdown
+            </div>
+            <span class="badge ${changedCount > 0 ? 'badge-amber' : 'badge-green'}" style="font-size: 11px; font-weight: 700;">
+              ${changedCount} ${changedCount === 1 ? 'Field Changed' : 'Fields Changed'}
+            </span>
+            ${unchangedCount > 0 ? `<label style="font-size: 12px; color: var(--text-muted); cursor: pointer; display: flex; align-items: center; gap: 4px; margin-left: 8px;">
+              <input type="checkbox" id="chk-show-unchanged" onchange="toggleAuditUnchangedFields(this.checked)" checked>
+              <span>Show unchanged (${unchangedCount})</span>
+            </label>` : ''}
+          </div>
+
+          <div style="display: flex; gap: 6px;">
+            <button id="btn-view-visual" class="btn btn-primary btn-sm" onclick="switchAuditViewTab('visual')" style="padding: 4px 10px; font-size: 12px;">Visual Comparison</button>
+            <button id="btn-view-raw" class="btn btn-outline btn-sm" onclick="switchAuditViewTab('raw')" style="padding: 4px 10px; font-size: 12px;">Raw JSON</button>
+          </div>
+        </div>
+
+        <!-- View 1: Visual Comparison Table -->
+        <div id="audit-view-visual" style="border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: #FFFFFF;">
+          <table class="data-table" style="margin: 0;">
+            <thead>
+              <tr style="background: #F8FAFC;">
+                <th style="width: 25%;">Field / Property</th>
+                <th style="width: 15%;">Change Type</th>
+                <th style="width: 30%;">State Before Change</th>
+                <th style="width: 30%;">State After Change</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows.length === 0 ? '<tr><td colspan="4" style="text-align: center; padding: 24px; color: var(--text-muted);">No payload data recorded for this audit entry.</td></tr>' : rows.map(r => {
+                let badge = '<span class="badge badge-amber">MODIFIED</span>';
+                if (r.type === 'ADDED') badge = '<span class="badge badge-green">ADDED</span>';
+                if (r.type === 'REMOVED') badge = '<span class="badge badge-red">REMOVED</span>';
+                if (r.type === 'UNCHANGED') badge = '<span class="badge badge-gray" style="opacity: 0.7;">UNCHANGED</span>';
+
+                let beforeHtml = formatFieldValue(r.before);
+                let afterHtml = formatFieldValue(r.after);
+
+                if (r.type === 'MODIFIED') {
+                  beforeHtml = `<div style="background: #FEF2F2; color: #991B1B; border: 1px solid #FECACA; padding: 6px 10px; border-radius: 6px; font-size: 12.5px; text-decoration: line-through;">
+                    <span style="font-weight: 800; margin-right: 4px; color: #DC2626;">-</span>${beforeHtml}
+                  </div>`;
+                  afterHtml = `<div style="background: #F0FDF4; color: #166534; border: 1px solid #BBF7D0; padding: 6px 10px; border-radius: 6px; font-size: 12.5px; font-weight: 700;">
+                    <span style="font-weight: 800; margin-right: 4px; color: #16A34A;">+</span>${afterHtml}
+                  </div>`;
+                } else if (r.type === 'ADDED') {
+                  beforeHtml = '<span style="color: #94A3B8; font-style: italic; font-size: 12px;">(Not Set / Initial)</span>';
+                  afterHtml = `<div style="background: #F0FDF4; color: #166534; border: 1px solid #BBF7D0; padding: 6px 10px; border-radius: 6px; font-size: 12.5px; font-weight: 700;">
+                    <span style="font-weight: 800; margin-right: 4px; color: #16A34A;">+</span>${afterHtml}
+                  </div>`;
+                } else if (r.type === 'REMOVED') {
+                  beforeHtml = `<div style="background: #FEF2F2; color: #991B1B; border: 1px solid #FECACA; padding: 6px 10px; border-radius: 6px; font-size: 12.5px; text-decoration: line-through;">
+                    <span style="font-weight: 800; margin-right: 4px; color: #DC2626;">-</span>${beforeHtml}
+                  </div>`;
+                  afterHtml = '<span style="color: #94A3B8; font-style: italic; font-size: 12px;">(Removed / Cleared)</span>';
+                }
+
+                return `
+                  <tr class="audit-row ${r.changed ? 'audit-row-changed' : 'audit-row-unchanged'}" style="${!r.changed ? 'background: #FAFBFD;' : 'background: #FFFDF9;'}">
+                    <td>
+                      <div style="font-weight: 700; color: #0F172A; font-size: 13px;">${escapeHtml(formatFieldName(r.key))}</div>
+                      <div style="font-size: 10.5px; color: var(--text-muted); font-family: monospace;">${escapeHtml(r.key)}</div>
+                    </td>
+                    <td>${badge}</td>
+                    <td>${beforeHtml}</td>
+                    <td>${afterHtml}</td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+          </table>
+        </div>
+
+        <!-- View 2: Raw JSON Payloads (Side-by-side) -->
+        <div id="audit-view-raw" style="display: none;">
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 14px;">
+            <div>
+              <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                <span style="font-size: 12px; font-weight: 700; color: #DC2626;">STATE BEFORE (PREVIOUS)</span>
+                <button class="btn btn-outline btn-sm" style="padding: 2px 8px; font-size: 11px;" onclick="copyAuditJson('raw-before-json')">Copy</button>
+              </div>
+              <pre id="raw-before-json" style="background: #0F172A; color: #F8FAFC; padding: 14px; border-radius: 8px; font-size: 12px; max-height: 340px; overflow: auto; line-height: 1.45;">${escapeHtml(JSON.stringify(before, null, 2))}</pre>
+            </div>
+
+            <div>
+              <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                <span style="font-size: 12px; font-weight: 700; color: #16A34A;">STATE AFTER (MODIFIED)</span>
+                <button class="btn btn-outline btn-sm" style="padding: 2px 8px; font-size: 11px;" onclick="copyAuditJson('raw-after-json')">Copy</button>
+              </div>
+              <pre id="raw-after-json" style="background: #0F172A; color: #F8FAFC; padding: 14px; border-radius: 8px; font-size: 12px; max-height: 340px; overflow: auto; line-height: 1.45;">${escapeHtml(JSON.stringify(after, null, 2))}</pre>
+            </div>
+          </div>
+        </div>
+      `;
+
+      if (window.lucide) lucide.createIcons();
+    }
+
+    function toggleAuditUnchangedFields(show) {
+      document.querySelectorAll('.audit-row-unchanged').forEach(el => {
+        el.style.display = show ? '' : 'none';
+      });
+    }
+
+    function switchAuditViewTab(tab) {
+      const vVisual = document.getElementById('audit-view-visual');
+      const vRaw = document.getElementById('audit-view-raw');
+      const btnVisual = document.getElementById('btn-view-visual');
+      const btnRaw = document.getElementById('btn-view-raw');
+
+      if (tab === 'visual') {
+        if (vVisual) vVisual.style.display = 'block';
+        if (vRaw) vRaw.style.display = 'none';
+        if (btnVisual) { btnVisual.className = 'btn btn-primary btn-sm'; }
+        if (btnRaw) { btnRaw.className = 'btn btn-outline btn-sm'; }
+      } else {
+        if (vVisual) vVisual.style.display = 'none';
+        if (vRaw) vRaw.style.display = 'block';
+        if (btnVisual) { btnVisual.className = 'btn btn-outline btn-sm'; }
+        if (btnRaw) { btnRaw.className = 'btn btn-primary btn-sm'; }
+      }
+    }
+
+    function copyAuditJson(elementId) {
+      const el = document.getElementById(elementId);
+      if (el) {
+        navigator.clipboard.writeText(el.innerText).then(() => {
+          showToast('JSON payload copied to clipboard.');
+        }).catch(() => {
+          showToast('Could not copy automatically.');
+        });
+      }
     }
 
     // ─── 10. Reports CSV Downloader ──────────────────────────────────────────

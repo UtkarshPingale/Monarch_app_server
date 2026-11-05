@@ -2354,13 +2354,17 @@ INDEX_HTML = r"""<!DOCTYPE html>
     function togglePasswordVisibility() {
       const p = document.getElementById('login-pwd');
       const eye = document.getElementById('pwd-eye-icon');
+      if (!p) return;
+      const s = p.selectionStart;
+      const e = p.selectionEnd;
       if (p.type === 'password') {
         p.type = 'text';
-        eye.setAttribute('data-lucide', 'eye-off');
+        if (eye) eye.setAttribute('data-lucide', 'eye-off');
       } else {
         p.type = 'password';
-        eye.setAttribute('data-lucide', 'eye');
+        if (eye) eye.setAttribute('data-lucide', 'eye');
       }
+      try { p.setSelectionRange(s, e); } catch (_) {}
       safeCreateIcons();
     }
 
@@ -4400,6 +4404,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
               ${dCount === 0.5 && l.from_session ? `<span style="font-weight: 700; background: #DBEAFE; color: #1E40AF; padding: 2px 8px; border-radius: 6px;">${l.from_session}</span>` : `<span>${dCount === 0.5 ? 'Half Day (0.5)' : dCount + ' Day' + (dCount > 1 ? 's' : '')}</span>`}
             </div>
             ${l.rejection_reason ? `<div style="margin-top: 6px; font-size: 11px; color: #DC2626; background: #FEF2F2; padding: 6px 10px; border-radius: 6px;">Reason: ${l.rejection_reason}</div>` : ''}
+            ${(l.status || '').toLowerCase().includes('pending') ? `
+              <div style="margin-top: 8px; display: flex; justify-content: flex-end;">
+                <button onclick="withdrawMyLeave(${l.id})" style="border: 1px solid #EA580C; background: #FFF7ED; color: #EA580C; padding: 4px 10px; border-radius: 8px; font-size: 11px; font-weight: 700; cursor: pointer; display: flex; align-items: center; gap: 4px;">
+                  <i data-lucide="undo-2" style="width: 12px;"></i>
+                  <span>Withdraw Leave</span>
+                </button>
+              </div>
+            ` : (isAppr ? `
+              <div style="margin-top: 6px; font-size: 10.5px; color: #64748B; font-style: italic;">
+                ℹ️ Approved leave • Contact your Reporting Manager to cancel
+              </div>
+            ` : '')}
           </div>
         `;
       });
@@ -4439,9 +4455,9 @@ INDEX_HTML = r"""<!DOCTYPE html>
           const isAdmin = roleStr === 'admin' || roleStr === 'superadmin' || ['965', '1844', '1951', '1009', '1228', '10001', '10003'].includes(cleanEid);
           
           const teamLeavesFilter = document.getElementById('team-leaves-filter-container');
-          if (teamLeavesFilter) teamLeavesFilter.style.display = isAdmin ? 'flex' : 'none';
+          if (teamLeavesFilter) teamLeavesFilter.style.display = 'flex';
 
-          state.teamLeaves = isAdmin ? rawLeaves : rawLeaves.filter(l => (l.status || '').toLowerCase().includes('pending'));
+          state.teamLeaves = rawLeaves;
 
           const teamLeavesDeptFilter = document.getElementById('team-leaves-dept-filter-container');
           if (teamLeavesDeptFilter) {
@@ -4611,7 +4627,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
                   <span>Reject</span>
                 </button>
               </div>
-            ` : ''}
+            ` : (isAppr ? `
+              <div style="margin-top: 6px;">
+                <button onclick="reviewSubordinateLeave(${l.id}, 'cancel')" class="btn-reject-outline" style="border-color: #DC2626; color: #DC2626; width: 100%; display: flex; align-items: center; justify-content: center; gap: 6px; padding: 8px 12px; border-radius: 10px; font-weight: 700; font-size: 12px;">
+                  <i data-lucide="slash" style="width: 14px;"></i>
+                  <span>Cancel & Remove Approved Leave</span>
+                </button>
+              </div>
+            ` : '')}
           </div>
         `;
       });
@@ -4652,17 +4675,55 @@ INDEX_HTML = r"""<!DOCTYPE html>
     }
 
     async function reviewSubordinateLeave(id, action) {
-      if (!confirm(`Are you sure you want to ${action} this leave request?`)) return;
+      let confirmMsg = `Are you sure you want to ${action} this leave request?`;
+      if (action === 'cancel') {
+        confirmMsg = 'Are you sure you want to cancel and remove this approved leave? This will cancel the leave and restore the employee\'s leave quota balance.';
+      }
+      if (!confirm(confirmMsg)) return;
+
+      let note = '';
+      if (action === 'cancel') {
+        note = prompt('Reason for cancelling approved leave (Optional):', 'Cancelled by reporting manager') || 'Cancelled by reporting manager';
+      }
+
       try {
-        await fetch(`/api/team/leaves/${id}/action`, {
+        const res = await fetch(`/api/team/leaves/${id}/action`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${state.token}` },
-          body: JSON.stringify({ action: action })
+          body: JSON.stringify({ action: action, note: note })
         });
-        alert(`✅ Leave request ${action}d successfully!`);
-        loadTeamApprovalsData();
+        const d = await res.json();
+        if (d.error) {
+          alert('Error: ' + d.error);
+        } else {
+          const succMsg = action === 'cancel'
+            ? '✅ Approved leave cancelled and quota restored successfully!'
+            : `✅ Leave request ${action}d successfully!`;
+          alert(succMsg);
+          loadTeamApprovalsData();
+        }
       } catch (_) {
         alert('Action failed');
+      }
+    }
+
+    async function withdrawMyLeave(id) {
+      if (!confirm('Are you sure you want to withdraw this leave request?')) return;
+      try {
+        const res = await fetch(`/api/leaves/${id}/withdraw`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${state.token}` },
+          body: JSON.stringify({ reason: 'Withdrawn by employee via Web Portal' })
+        });
+        const d = await res.json();
+        if (d.error) {
+          alert('Error: ' + d.error);
+        } else {
+          alert('✅ Leave request withdrawn successfully!');
+          loadLeavesData();
+        }
+      } catch (e) {
+        alert('Failed to withdraw leave: ' + e);
       }
     }
 
