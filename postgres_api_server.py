@@ -4723,6 +4723,284 @@ def register_admin_dashboard(app, get_monarch_connection, get_db_connection, tok
                 cur.close()
                 conn.close()
 
+    @app.route('/api/admin/dashboard/activity-stream', methods=['GET'])
+    @token_required
+    @admin_required
+    def get_dashboard_activity_stream():
+        period = request.args.get('period', 'today').lower()
+        filter_mode = request.args.get('filter', 'all').lower().strip()
+        search = (request.args.get('search') or '').strip().lower()
+        page = max(1, int(request.args.get('page', 1)))
+        limit = max(1, min(100, int(request.args.get('limit', 25))))
+        offset = (page - 1) * limit
+
+        today_date = get_ist_today()
+        today_str = today_date.isoformat()
+
+        if period == 'week':
+            start_date = (today_date - datetime.timedelta(days=6)).isoformat()
+            end_date = today_str
+        elif period == 'month':
+            start_date = (today_date - datetime.timedelta(days=29)).isoformat()
+            end_date = today_str
+        else:
+            period = 'today'
+            start_date = today_str
+            end_date = today_str
+
+        conn = None
+        try:
+            conn = get_monarch_connection()
+            cur = conn.cursor()
+
+            # 1. Compute dynamic live counts for filter badges across current period
+            cur.execute("SELECT COUNT(*) AS total FROM data.users WHERE is_active IS NOT FALSE;")
+            total_headcount = cur.fetchone()['total'] or 0
+
+            cur.execute("""
+                SELECT COUNT(DISTINCT employee_id) AS present
+                FROM data.attendance
+                WHERE date BETWEEN %s AND %s AND sign_in IS NOT NULL;
+            """, (start_date, end_date))
+            cnt_present = cur.fetchone()['present'] or 0
+
+            cur.execute("""
+                SELECT COUNT(*) AS active_now
+                FROM data.attendance
+                WHERE date = %s AND sign_in IS NOT NULL AND sign_out IS NULL;
+            """, (today_str,))
+            cnt_active = cur.fetchone()['active_now'] or 0
+
+            cur.execute("""
+                SELECT COUNT(DISTINCT employee_id) AS on_leave
+                FROM data.leaves
+                WHERE ((start_date <= %s AND end_date >= %s) OR (start_date BETWEEN %s AND %s))
+                  AND status ILIKE '%%approved%%';
+            """, (end_date, start_date, start_date, end_date))
+            cnt_leave = cur.fetchone()['on_leave'] or 0
+
+            cnt_absent = max(0, total_headcount - cnt_present - cnt_leave)
+
+            cur.execute("""
+                SELECT COUNT(*) AS late_count
+                FROM data.attendance
+                WHERE date BETWEEN %s AND %s AND sign_in > '09:45:00';
+            """, (start_date, end_date))
+            cnt_late = cur.fetchone()['late_count'] or 0
+
+            if period == 'today':
+                cnt_unclosed = cnt_active
+            else:
+                cur.execute("""
+                    SELECT COUNT(*) AS unclosed
+                    FROM data.attendance
+                    WHERE date BETWEEN %s AND %s AND sign_in IS NOT NULL AND sign_out IS NULL;
+                """, (start_date, end_date))
+                cnt_unclosed = cur.fetchone()['unclosed'] or 0
+
+            cur.execute("""
+                SELECT COUNT(*) AS total_punches
+                FROM data.attendance
+                WHERE date BETWEEN %s AND %s;
+            """, (start_date, end_date))
+            cnt_all = cur.fetchone()['total_punches'] or 0
+
+            # 2. Fetch records according to filter_mode
+            records = []
+            total_records = 0
+
+            if filter_mode in ['leave', 'leaves', 'on_leave']:
+                where = [
+                    "((l.start_date <= %s AND l.end_date >= %s) OR (l.start_date BETWEEN %s AND %s))",
+                    "l.status ILIKE '%%approved%%'"
+                ]
+                params = [end_date, start_date, start_date, end_date]
+
+                if search:
+                    where.append("(LOWER(l.employee_name) LIKE %s OR l.employee_id LIKE %s OR LOWER(COALESCE(l.department, '')) LIKE %s OR LOWER(COALESCE(l.leave_type, '')) LIKE %s)")
+                    s_val = f"%{search}%"
+                    params.extend([s_val, f"%{search.lstrip('#')}%", s_val, s_val])
+
+                where_str = " AND ".join(where)
+                cur.execute(f"SELECT COUNT(*) AS total FROM data.leaves l WHERE {where_str};", tuple(params))
+                total_records = cur.fetchone()['total'] or 0
+
+                query = f"""
+                    SELECT l.id, l.employee_id, l.employee_name, l.department, l.leave_type, l.start_date, l.end_date,
+                           l.days_count, l.status, l.title, l.note, u.designation
+                    FROM data.leaves l
+                    LEFT JOIN data.users u ON u.employee_no::text = l.employee_id
+                    WHERE {where_str}
+                    ORDER BY l.start_date DESC, l.id DESC
+                    LIMIT %s OFFSET %s;
+                """
+                params.extend([limit, offset])
+                cur.execute(query, tuple(params))
+                for r in cur.fetchall():
+                    st_d = r['start_date'].isoformat() if hasattr(r['start_date'], 'isoformat') else str(r['start_date'])
+                    en_d = r['end_date'].isoformat() if hasattr(r['end_date'], 'isoformat') else str(r['end_date'])
+                    date_lbl = f"{st_d} to {en_d}" if st_d != en_d else st_d
+                    days = r.get('days_count') or 1
+                    try:
+                        days = int(days) if float(days).is_integer() else float(days)
+                    except Exception:
+                        pass
+                    records.append({
+                        'id': r['id'],
+                        'record_type': 'leave',
+                        'employee_id': r['employee_id'],
+                        'employee_name': r.get('employee_name') or f"Employee {r['employee_id']}",
+                        'department': r.get('department') or 'Operations',
+                        'designation': r.get('designation') or 'Staff',
+                        'date': date_lbl,
+                        'sign_in': 'On Leave',
+                        'sign_out': f"{r.get('leave_type') or 'Approved Leave'} ({days}d)",
+                        'location': r.get('title') or r.get('note') or 'Approved Absence',
+                        'in_geofence': True,
+                        'is_late': False,
+                        'is_active': False,
+                        'status': 'Approved Leave'
+                    })
+
+            elif filter_mode in ['absent', 'inactive']:
+                where = ["u.is_active IS NOT FALSE"]
+                params = [start_date, end_date, end_date, start_date, start_date, end_date]
+                where.append("""
+                    u.employee_no::text NOT IN (
+                        SELECT DISTINCT employee_id FROM data.attendance 
+                        WHERE date BETWEEN %s AND %s AND sign_in IS NOT NULL AND employee_id IS NOT NULL
+                    )
+                """)
+                where.append("""
+                    u.employee_no::text NOT IN (
+                        SELECT DISTINCT employee_id FROM data.leaves 
+                        WHERE ((start_date <= %s AND end_date >= %s) OR (start_date BETWEEN %s AND %s))
+                          AND status ILIKE '%%approved%%' AND employee_id IS NOT NULL
+                    )
+                """)
+
+                if search:
+                    where.append("(LOWER(u.name) LIKE %s OR u.employee_no::text LIKE %s OR LOWER(COALESCE(u.department, '')) LIKE %s OR LOWER(COALESCE(u.designation, '')) LIKE %s)")
+                    s_val = f"%{search}%"
+                    params.extend([s_val, f"%{search.lstrip('#')}%", s_val, s_val])
+
+                where_str = " AND ".join(where)
+                cur.execute(f"SELECT COUNT(*) AS total FROM data.users u WHERE {where_str};", tuple(params))
+                total_records = cur.fetchone()['total'] or 0
+
+                query = f"""
+                    SELECT u.id, u.employee_no, u.name, u.department, u.designation
+                    FROM data.users u
+                    WHERE {where_str}
+                    ORDER BY u.employee_no ASC NULLS LAST, u.name ASC
+                    LIMIT %s OFFSET %s;
+                """
+                params.extend([limit, offset])
+                cur.execute(query, tuple(params))
+                for r in cur.fetchall():
+                    records.append({
+                        'id': r['id'],
+                        'record_type': 'absent',
+                        'employee_id': str(r['employee_no']),
+                        'employee_name': r.get('name') or f"Employee {r['employee_no']}",
+                        'department': r.get('department') or 'Unassigned',
+                        'designation': r.get('designation') or 'Staff',
+                        'date': today_str if period == 'today' else f"{start_date} to {end_date}",
+                        'sign_in': 'Absent',
+                        'sign_out': '--',
+                        'location': 'No punch recorded',
+                        'in_geofence': False,
+                        'is_late': False,
+                        'is_active': False,
+                        'status': 'Not Clocked In'
+                    })
+
+            else:
+                # Attendance punch events: 'all', 'present', 'active', 'late', 'unclosed'
+                where = ["a.date BETWEEN %s AND %s"]
+                params = [start_date, end_date]
+
+                if filter_mode == 'present':
+                    where.append("a.sign_in IS NOT NULL")
+                elif filter_mode == 'active':
+                    where = ["a.date = %s", "a.sign_in IS NOT NULL", "a.sign_out IS NULL"]
+                    params = [today_str]
+                elif filter_mode == 'late':
+                    where.append("a.sign_in > '09:45:00'")
+                elif filter_mode == 'unclosed':
+                    where.append("a.sign_in IS NOT NULL AND a.sign_out IS NULL")
+
+                if search:
+                    where.append("(LOWER(a.employee_name) LIKE %s OR a.employee_id LIKE %s OR LOWER(COALESCE(a.department, '')) LIKE %s)")
+                    s_val = f"%{search}%"
+                    params.extend([s_val, f"%{search.lstrip('#')}%", s_val])
+
+                where_str = " AND ".join(where)
+                cur.execute(f"SELECT COUNT(*) AS total FROM data.attendance a WHERE {where_str};", tuple(params))
+                total_records = cur.fetchone()['total'] or 0
+
+                query = f"""
+                    SELECT a.id, a.employee_id, a.employee_name, a.department, a.date, a.sign_in, a.sign_out,
+                           a.location, a.in_geofence, a.clock_in_lat, a.clock_in_lng, a.nearest_building,
+                           u.designation
+                    FROM data.attendance a
+                    LEFT JOIN data.users u ON u.employee_no::text = a.employee_id
+                    WHERE {where_str}
+                    ORDER BY a.date DESC, a.sign_in DESC NULLS LAST, a.id DESC
+                    LIMIT %s OFFSET %s;
+                """
+                params.extend([limit, offset])
+                cur.execute(query, tuple(params))
+                for r in cur.fetchall():
+                    is_late = bool(r.get('sign_in') and str(r['sign_in']) > '09:45:00')
+                    is_active = bool(r.get('sign_in') and not r.get('sign_out'))
+                    records.append({
+                        'id': r['id'],
+                        'record_type': 'attendance',
+                        'employee_id': r['employee_id'],
+                        'employee_name': r.get('employee_name') or f"Employee {r['employee_id']}",
+                        'department': r.get('department') or 'Operations',
+                        'designation': r.get('designation') or 'Staff',
+                        'date': r['date'].isoformat() if hasattr(r['date'], 'isoformat') else str(r['date']),
+                        'sign_in': str(r['sign_in'])[:8] if r.get('sign_in') else None,
+                        'sign_out': str(r['sign_out'])[:8] if r.get('sign_out') else None,
+                        'location': r.get('location') or 'Biometric / Mobile',
+                        'in_geofence': bool(r.get('in_geofence', True)),
+                        'is_late': is_late,
+                        'is_active': is_active,
+                        'status': 'Working Now' if is_active else ('Late Arrival' if is_late else 'Punched Out'),
+                        'nearest_building': r.get('nearest_building') or 'Monarch House (HQ)'
+                    })
+
+            total_pages = max(1, (total_records + limit - 1) // limit)
+
+            return jsonify({
+                'success': True,
+                'filter': filter_mode,
+                'period': period,
+                'total': total_records,
+                'page': page,
+                'limit': limit,
+                'total_pages': total_pages,
+                'records': records,
+                'counts': {
+                    'all': cnt_all,
+                    'present': cnt_present,
+                    'active': cnt_active,
+                    'leave': cnt_leave,
+                    'absent': cnt_absent,
+                    'late': cnt_late,
+                    'unclosed': cnt_unclosed
+                }
+            })
+
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+        finally:
+            if conn:
+                cur.close()
+                conn.close()
+
     # ─── 2. Employee Management Module ──────────────────────────────────────────
     @app.route('/api/admin/employees', methods=['GET'])
     @token_required
@@ -8415,6 +8693,178 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
       overflow: hidden;
       transition: transform 0.15s ease, box-shadow 0.15s ease;
     }
+        /* ─── Modern Dashboard KPI & Interactive Filter Cards ─── */
+    .kpi-card {
+      background: #FFFFFF;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 16px 18px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.02);
+      position: relative;
+      overflow: hidden;
+      transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .kpi-card-clickable {
+      cursor: pointer;
+      user-select: none;
+    }
+    .kpi-card-clickable:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 16px -2px rgba(0, 0, 0, 0.06), 0 3px 6px -2px rgba(0, 0, 0, 0.03);
+      border-color: #CBD5E1;
+    }
+    .kpi-card-clickable.active-kpi-filter {
+      box-shadow: 0 0 0 2px var(--primary-subtle), 0 8px 16px -3px rgba(234, 88, 12, 0.15) !important;
+      background: #FFFFFF;
+    }
+    .kpi-card-clickable.active-kpi-filter::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: 3.5px;
+      background: var(--card-accent, var(--primary));
+    }
+    .kpi-active-tag {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      font-size: 9.5px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      padding: 2px 6px;
+      border-radius: 8px;
+      display: none;
+    }
+    .kpi-card-clickable.active-kpi-filter .kpi-active-tag {
+      display: inline-block;
+    }
+
+    /* ─── Stream Segmented Toolbar (Modern Linear / Apple Style) ─── */
+    .stream-segmented-bar-wrap {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+      gap: 12px;
+      background: #F8FAFC;
+      border: 1px solid #E2E8F0;
+      border-radius: 10px;
+      padding: 6px 10px;
+    }
+    .stream-segmented-bar {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      overflow-x: auto;
+      max-width: 100%;
+    }
+    .seg-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 11px;
+      background: transparent;
+      border: none;
+      border-radius: 7px;
+      font-size: 12px;
+      font-weight: 600;
+      color: #64748B;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.15s ease;
+      user-select: none;
+    }
+    .seg-item:hover {
+      color: #0F172A;
+      background: rgba(255, 255, 255, 0.7);
+    }
+    .seg-item.active {
+      background: #FFFFFF !important;
+      color: #0F172A !important;
+      font-weight: 700;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
+    }
+    .seg-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .dot-present { background: #10B981; }
+    .dot-active { background: #F59E0B; }
+    .dot-leave { background: #8B5CF6; }
+    .dot-absent { background: #EF4444; }
+    .dot-late { background: #E11D48; }
+    .dot-unclosed { background: #475569; }
+
+    .seg-count {
+      font-size: 11px;
+      font-weight: 700;
+      padding: 1px 6px;
+      border-radius: 8px;
+      background: #E2E8F0;
+      color: #475569;
+      transition: all 0.15s ease;
+    }
+    .seg-item.active .seg-count {
+      background: #0F172A;
+      color: #FFFFFF;
+    }
+
+    .stream-meta-pagination {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+    .stream-range-info {
+      white-space: nowrap;
+    }
+    .stream-range-info strong {
+      color: #0F172A;
+    }
+    .stream-page-btns {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .btn-page {
+      width: 26px;
+      height: 26px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: #FFFFFF;
+      border: 1px solid #CBD5E1;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #475569;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .btn-page:hover:not(:disabled) {
+      border-color: #94A3B8;
+      color: #0F172A;
+      background: #F8FAFC;
+    }
+    .btn-page:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+    .stream-page-label {
+      font-size: 11.5px;
+      font-weight: 600;
+      color: #475569;
+      padding: 0 4px;
+      white-space: nowrap;
+    }
+
     .kpi-card:hover {
       transform: translateY(-2px);
       box-shadow: 0 4px 12px rgba(0,0,0,0.05);
@@ -8430,6 +8880,20 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
     }
 
     /* Tables */
+        .stream-table-wrapper {
+      overflow-x: auto;
+      min-height: 480px;
+      position: relative;
+      transition: min-height 0.25s ease;
+    }
+    #table-recent-activity {
+      transition: opacity 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    #table-recent-activity.is-loading {
+      opacity: 0.35;
+      pointer-events: none;
+    }
+
     .data-table {
       width: 100%;
       border-collapse: separate;
@@ -8882,155 +9346,287 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
 
       <!-- ═════════════════ TAB 1: DASHBOARD OVERVIEW ═════════════════ -->
       <section id="view-dashboard">
-        <!-- Filter Bar -->
-        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; flex-wrap: wrap; gap: 12px;">
+        <!-- Top Title & Period Switcher -->
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; flex-wrap: wrap; gap: 12px;">
           <div>
-            <h2 id="dashboard-title" style="font-size: 15px; font-weight: 700; color: #0F172A;">Enterprise Operations Today</h2>
-            <p id="dashboard-subtitle" style="font-size: 12.5px; color: var(--text-muted);">Real-time aggregated KPIs from biometric terminals and mobile GPS punches.</p>
+            <h2 id="dashboard-title" style="font-size: 16px; font-weight: 800; color: #0F172A; margin: 0;">Enterprise Operations Today</h2>
+            <p id="dashboard-subtitle" style="font-size: 12.5px; color: var(--text-muted); margin-top: 3px;">Real-time aggregated KPIs from biometric terminals and mobile GPS punches.</p>
           </div>
           <div style="display: flex; align-items: center; gap: 8px;">
-            <div style="display: flex; background: #FFFFFF; border: 1px solid var(--border); border-radius: 8px; padding: 3px;">
-              <button class="btn btn-sm" id="btn-period-today" style="background: var(--primary); color: #0F172A; font-weight: 700;" onclick="setPeriodFilter('today')">Today</button>
-              <button class="btn btn-sm" id="btn-period-week" style="background: transparent; color: #64748B;" onclick="setPeriodFilter('week')">This Week</button>
-              <button class="btn btn-sm" id="btn-period-month" style="background: transparent; color: #64748B;" onclick="setPeriodFilter('month')">This Month</button>
+            <div style="display: flex; background: #FFFFFF; border: 1px solid var(--border); border-radius: 8px; padding: 3px; box-shadow: 0 1px 2px rgba(0,0,0,0.03);">
+              <button class="btn btn-sm" id="btn-period-today" style="background: var(--primary); color: #0F172A; font-weight: 700; border-radius: 6px; padding: 5px 12px;" onclick="setPeriodFilter('today')">Today</button>
+              <button class="btn btn-sm" id="btn-period-week" style="background: transparent; color: #64748B; border-radius: 6px; padding: 5px 12px;" onclick="setPeriodFilter('week')">This Week</button>
+              <button class="btn btn-sm" id="btn-period-month" style="background: transparent; color: #64748B; border-radius: 6px; padding: 5px 12px;" onclick="setPeriodFilter('month')">This Month</button>
             </div>
           </div>
         </div>
 
-        <!-- 10 KPI Cards Grid -->
-        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 28px;">
+        <!-- ═════════ 1. WORKFORCE STATUS PULSE (7 Interactive Filter Cards) ═════════ -->
+        <div style="margin-bottom: 20px;">
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px;">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span style="font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.6px; color: #475569;">Workforce Status Pulse</span>
+              <span style="font-size: 11px; color: #94A3B8;">• Click any card to filter list below</span>
+            </div>
+            <span id="kpi-active-filter-hint" style="font-size: 11.5px; color: var(--primary-dark); font-weight: 700; background: var(--primary-subtle); padding: 2px 10px; border-radius: 12px;">Active Filter: All Activity</span>
+          </div>
+
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 14px;">
+            
+            <!-- 1. Total Headcount -->
+            <div class="kpi-card kpi-card-clickable active-kpi-filter" id="kpi-card-total" style="--card-accent: #2563EB;" onclick="setStreamFilter('all', true)" title="Filter Stream: All Activity">
+              <span class="kpi-active-tag" style="background: #EFF6FF; color: #2563EB;">Active</span>
+              <div class="kpi-icon-wrap" style="background: var(--blue-bg); color: var(--blue); width: 38px; height: 38px; border-radius: 10px; margin-bottom: 10px;"><i data-lucide="users" style="width: 18px; height: 18px;"></i></div>
+              <div style="font-size: 11.5px; font-weight: 600; color: var(--text-muted);">Total Staff</div>
+              <div style="font-size: 24px; font-weight: 800; color: #0F172A; margin: 3px 0;" id="kpi-total-emp">--</div>
+              <div style="font-size: 11px; color: #10B981; font-weight: 600;">Directory verified</div>
+            </div>
+
+            <!-- 2. Present Today -->
+            <div class="kpi-card kpi-card-clickable" id="kpi-card-present" style="--card-accent: #10B981;" onclick="setStreamFilter('present', true)" title="Filter Stream: Present Today">
+              <span class="kpi-active-tag" style="background: #ECFDF5; color: #059669;">Active</span>
+              <div class="kpi-icon-wrap" style="background: var(--green-bg); color: var(--green); width: 38px; height: 38px; border-radius: 10px; margin-bottom: 10px;"><i data-lucide="check-circle-2" style="width: 18px; height: 18px;"></i></div>
+              <div id="lbl-kpi-present" style="font-size: 11.5px; font-weight: 600; color: var(--text-muted);">Present</div>
+              <div style="font-size: 24px; font-weight: 800; color: var(--green); margin: 3px 0;" id="kpi-present">--</div>
+              <div style="font-size: 11px; color: var(--text-muted);">Logged in today</div>
+            </div>
+
+            <!-- 3. Active Checked In -->
+            <div class="kpi-card kpi-card-clickable" id="kpi-card-active" style="--card-accent: #F59E0B;" onclick="setStreamFilter('active', true)" title="Filter Stream: Active Checked In">
+              <span class="kpi-active-tag" style="background: #FEF3C7; color: #D97706;">Active</span>
+              <div class="kpi-icon-wrap" style="background: var(--amber-bg); color: var(--amber); width: 38px; height: 38px; border-radius: 10px; margin-bottom: 10px;"><i data-lucide="clock" style="width: 18px; height: 18px;"></i></div>
+              <div style="font-size: 11.5px; font-weight: 600; color: var(--text-muted);">Checked In</div>
+              <div style="font-size: 24px; font-weight: 800; color: var(--amber); margin: 3px 0;" id="kpi-checked-in">--</div>
+              <div style="font-size: 11px; color: #10B981; font-weight: 600;">● Shifts in progress</div>
+            </div>
+
+            <!-- 4. On Leave -->
+            <div class="kpi-card kpi-card-clickable" id="kpi-card-leave" style="--card-accent: #8B5CF6;" onclick="setStreamFilter('leave', true)" title="Filter Stream: On Leave">
+              <span class="kpi-active-tag" style="background: #EDE9FE; color: #7C3AED;">Active</span>
+              <div class="kpi-icon-wrap" style="background: var(--purple-bg); color: var(--purple); width: 38px; height: 38px; border-radius: 10px; margin-bottom: 10px;"><i data-lucide="calendar" style="width: 18px; height: 18px;"></i></div>
+              <div id="lbl-kpi-on-leave" style="font-size: 11.5px; font-weight: 600; color: var(--text-muted);">On Leave</div>
+              <div style="font-size: 24px; font-weight: 800; color: var(--purple); margin: 3px 0;" id="kpi-on-leave">--</div>
+              <div style="font-size: 11px; color: var(--text-muted);">Approved absence</div>
+            </div>
+
+            <!-- 5. Absent Today -->
+            <div class="kpi-card kpi-card-clickable" id="kpi-card-absent" style="--card-accent: #EF4444;" onclick="setStreamFilter('absent', true)" title="Filter Stream: Absent Today">
+              <span class="kpi-active-tag" style="background: #FEE2E2; color: #DC2626;">Active</span>
+              <div class="kpi-icon-wrap" style="background: var(--red-bg); color: var(--red); width: 38px; height: 38px; border-radius: 10px; margin-bottom: 10px;"><i data-lucide="user-x" style="width: 18px; height: 18px;"></i></div>
+              <div id="lbl-kpi-absent" style="font-size: 11.5px; font-weight: 600; color: var(--text-muted);">Absent</div>
+              <div style="font-size: 24px; font-weight: 800; color: var(--red); margin: 3px 0;" id="kpi-absent">--</div>
+              <div style="font-size: 11px; color: var(--text-muted);" id="lbl-kpi-absent-sub">Not punched</div>
+            </div>
+
+            <!-- 6. Late Arrivals -->
+            <div class="kpi-card kpi-card-clickable" id="kpi-card-late" style="--card-accent: #E11D48;" onclick="setStreamFilter('late', true)" title="Filter Stream: Late Arrivals">
+              <span class="kpi-active-tag" style="background: #FFE4E6; color: #E11D48;">Active</span>
+              <div class="kpi-icon-wrap" style="background: #FFF1F2; color: #E11D48; width: 38px; height: 38px; border-radius: 10px; margin-bottom: 10px;"><i data-lucide="alert-triangle" style="width: 18px; height: 18px;"></i></div>
+              <div id="lbl-kpi-late" style="font-size: 11.5px; font-weight: 600; color: var(--text-muted);">Late Arrivals</div>
+              <div style="font-size: 24px; font-weight: 800; color: #E11D48; margin: 3px 0;" id="kpi-late">--</div>
+              <div style="font-size: 11px; color: var(--text-muted);">> 09:45 AM Grace</div>
+            </div>
+
+            <!-- 7. Unclosed Shifts -->
+            <div class="kpi-card kpi-card-clickable" id="kpi-card-unclosed" style="--card-accent: #475569;" onclick="setStreamFilter('unclosed', true)" title="Filter Stream: Unclosed Shifts">
+              <span class="kpi-active-tag" style="background: #F1F5F9; color: #475569;">Active</span>
+              <div class="kpi-icon-wrap" style="background: #F1F5F9; color: #475569; width: 38px; height: 38px; border-radius: 10px; margin-bottom: 10px;"><i data-lucide="log-out" style="width: 18px; height: 18px;"></i></div>
+              <div id="lbl-kpi-unclosed" style="font-size: 11.5px; font-weight: 600; color: var(--text-muted);">Unclosed Shifts</div>
+              <div style="font-size: 24px; font-weight: 800; color: #475569; margin: 3px 0;" id="kpi-unclosed">--</div>
+              <div style="font-size: 11px; color: var(--text-muted);">No clock-out yet</div>
+            </div>
+
+          </div>
+        </div>
+
+        <!-- ═════════ 2. KEY OPERATIONAL METRICS (3 Highlight Cards) ═════════ -->
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin-bottom: 24px;">
           
-          <div class="kpi-card">
-            <div class="kpi-icon-wrap" style="background: var(--blue-bg); color: var(--blue);"><i data-lucide="users"></i></div>
-            <div style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Total Headcount</div>
-            <div style="font-size: 26px; font-weight: 800; color: #0F172A; margin: 4px 0;" id="kpi-total-emp">--</div>
-            <div style="font-size: 11px; color: #10B981; font-weight: 600;">Directory verified</div>
+          <div class="kpi-card" style="background: linear-gradient(180deg, #FFFFFF 0%, #F0FDF4 100%); border-color: #BBF7D0;">
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+              <div>
+                <div id="lbl-kpi-rate" style="font-size: 11px; font-weight: 700; color: #047857; text-transform: uppercase; letter-spacing: 0.5px;">Attendance Benchmark</div>
+                <div style="font-size: 24px; font-weight: 800; color: #059669; margin: 3px 0;" id="kpi-rate-pct">--%</div>
+                <div style="font-size: 11px; color: #065F46;" id="kpi-att-rate">Active participation</div>
+              </div>
+              <div class="kpi-icon-wrap" style="background: #DCFCE7; color: #059669; width: 42px; height: 42px; border-radius: 10px; margin-bottom: 0;"><i data-lucide="gauge"></i></div>
+            </div>
           </div>
 
-          <div class="kpi-card">
-            <div class="kpi-icon-wrap" style="background: var(--green-bg); color: var(--green);"><i data-lucide="check-circle-2"></i></div>
-            <div id="lbl-kpi-present" style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Present Today</div>
-            <div style="font-size: 26px; font-weight: 800; color: var(--green); margin: 4px 0;" id="kpi-present">--</div>
-            <div style="font-size: 11px; color: var(--text-muted);" id="kpi-att-rate">--% Attendance</div>
+          <div class="kpi-card" style="background: linear-gradient(180deg, #FFFFFF 0%, #EFF6FF 100%); border-color: #BFDBFE;">
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+              <div>
+                <div id="lbl-kpi-hours" style="font-size: 11px; font-weight: 700; color: #1D4ED8; text-transform: uppercase; letter-spacing: 0.5px;">Total Hours Logged</div>
+                <div style="font-size: 24px; font-weight: 800; color: #2563EB; margin: 3px 0;" id="kpi-work-hours">--</div>
+                <div style="font-size: 11px; color: #1E40AF;">Cumulative period hours</div>
+              </div>
+              <div class="kpi-icon-wrap" style="background: #DBEAFE; color: #2563EB; width: 42px; height: 42px; border-radius: 10px; margin-bottom: 0;"><i data-lucide="timer"></i></div>
+            </div>
           </div>
 
-          <div class="kpi-card">
-            <div class="kpi-icon-wrap" style="background: var(--red-bg); color: var(--red);"><i data-lucide="user-x"></i></div>
-            <div id="lbl-kpi-absent" style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Absent Today</div>
-            <div style="font-size: 26px; font-weight: 800; color: var(--red); margin: 4px 0;" id="kpi-absent">--</div>
-            <div style="font-size: 11px; color: var(--text-muted);" id="lbl-kpi-absent-sub">Not punched</div>
-          </div>
-
-          <div class="kpi-card">
-            <div class="kpi-icon-wrap" style="background: var(--purple-bg); color: var(--purple);"><i data-lucide="calendar"></i></div>
-            <div id="lbl-kpi-on-leave" style="font-size: 12px; font-weight: 600; color: var(--text-muted);">On Leave</div>
-            <div style="font-size: 26px; font-weight: 800; color: var(--purple); margin: 4px 0;" id="kpi-on-leave">--</div>
-            <div style="font-size: 11px; color: var(--text-muted);">Approved absence</div>
-          </div>
-
-          <div class="kpi-card">
-            <div class="kpi-icon-wrap" style="background: var(--amber-bg); color: var(--amber);"><i data-lucide="clock"></i></div>
-            <div style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Active Checked In</div>
-            <div style="font-size: 26px; font-weight: 800; color: var(--amber); margin: 4px 0;" id="kpi-checked-in">--</div>
-            <div style="font-size: 11px; color: #10B981; font-weight: 600;">● Shifts in progress</div>
-          </div>
-
-          <div class="kpi-card">
-            <div class="kpi-icon-wrap" style="background: #FFF1F2; color: #E11D48;"><i data-lucide="alert-triangle"></i></div>
-            <div id="lbl-kpi-late" style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Late Arrivals</div>
-            <div style="font-size: 26px; font-weight: 800; color: #E11D48; margin: 4px 0;" id="kpi-late">--</div>
-            <div style="font-size: 11px; color: var(--text-muted);">> 09:45 AM Grace</div>
-          </div>
-
-          <div class="kpi-card">
-            <div class="kpi-icon-wrap" style="background: #F1F5F9; color: #475569;"><i data-lucide="log-out"></i></div>
-            <div id="lbl-kpi-unclosed" style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Unclosed Shifts</div>
-            <div style="font-size: 26px; font-weight: 800; color: #475569; margin: 4px 0;" id="kpi-unclosed">--</div>
-            <div style="font-size: 11px; color: var(--text-muted);">No clock-out yet</div>
-          </div>
-
-          <div class="kpi-card">
-            <div class="kpi-icon-wrap" style="background: var(--primary-subtle); color: var(--primary-dark);"><i data-lucide="inbox"></i></div>
-            <div style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Pending Leaves</div>
-            <div style="font-size: 26px; font-weight: 800; color: var(--primary-dark); margin: 4px 0;" id="kpi-pending-leaves">--</div>
-            <div style="font-size: 11px; color: #2563EB; font-weight: 600; cursor: pointer;" onclick="switchTab('leaves')">Review queue →</div>
-          </div>
-
-          <div class="kpi-card">
-            <div class="kpi-icon-wrap" style="background: #ECFDF5; color: #059669;"><i data-lucide="gauge"></i></div>
-            <div id="lbl-kpi-rate" style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Attendance Rate</div>
-            <div style="font-size: 26px; font-weight: 800; color: #059669; margin: 4px 0;" id="kpi-rate-pct">--%</div>
-            <div style="font-size: 11px; color: var(--text-muted);">Company benchmark</div>
-          </div>
-
-          <div class="kpi-card">
-            <div class="kpi-icon-wrap" style="background: #EFF6FF; color: #2563EB;"><i data-lucide="timer"></i></div>
-            <div id="lbl-kpi-hours" style="font-size: 12px; font-weight: 600; color: var(--text-muted);">Total Hours Logged</div>
-            <div style="font-size: 26px; font-weight: 800; color: #2563EB; margin: 4px 0;" id="kpi-work-hours">--</div>
-            <div style="font-size: 11px; color: var(--text-muted);">Cumulative period</div>
+          <div class="kpi-card" style="background: linear-gradient(180deg, #FFFFFF 0%, #FFFBEB 100%); border-color: #FDE68A; cursor: pointer;" onclick="switchTab('leaves')">
+            <div style="display: flex; align-items: center; justify-content: space-between;">
+              <div>
+                <div style="font-size: 11px; font-weight: 700; color: #B45309; text-transform: uppercase; letter-spacing: 0.5px;">Pending Approvals Queue</div>
+                <div style="font-size: 24px; font-weight: 800; color: #D97706; margin: 3px 0;" id="kpi-pending-leaves">--</div>
+                <div style="font-size: 11px; color: #B45309; font-weight: 600;">Review leave requests →</div>
+              </div>
+              <div class="kpi-icon-wrap" style="background: #FEF3C7; color: #D97706; width: 42px; height: 42px; border-radius: 10px; margin-bottom: 0;"><i data-lucide="inbox"></i></div>
+            </div>
           </div>
 
         </div>
 
-        <!-- Charts Row -->
-        <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 20px; margin-bottom: 28px;">
+        <!-- ═════════ 3. CHARTS ROW ═════════ -->
+        <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 20px; margin-bottom: 24px;">
           <!-- 7-Day Trend Chart -->
-          <div style="background: #FFFFFF; border: 1px solid var(--border); border-radius: 14px; padding: 22px;">
-            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;">
+          <div style="background: #FFFFFF; border: 1px solid var(--border); border-radius: 14px; padding: 20px;">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px;">
               <div>
-                <h3 id="chart-trend-title" style="font-size: 14.5px; font-weight: 700; color: #0F172A;">Attendance Trend (Last 7 Days)</h3>
-                <p id="chart-trend-subtitle" style="font-size: 12px; color: var(--text-muted);">Daily volume of Present, Late, and Absent workforce</p>
+                <h3 id="chart-trend-title" style="font-size: 14px; font-weight: 700; color: #0F172A; margin: 0;">Attendance Trend (Last 7 Days)</h3>
+                <p id="chart-trend-subtitle" style="font-size: 11.5px; color: var(--text-muted); margin-top: 2px;">Daily volume of Present, Late, and Absent workforce</p>
               </div>
             </div>
-            <div style="height: 280px;">
+            <div style="height: 260px;">
               <canvas id="chart-attendance-trend"></canvas>
             </div>
           </div>
 
           <!-- Department Headcount Doughnut -->
-          <div style="background: #FFFFFF; border: 1px solid var(--border); border-radius: 14px; padding: 22px;">
-            <div style="margin-bottom: 16px;">
-              <h3 style="font-size: 14.5px; font-weight: 700; color: #0F172A;">Department Allocation</h3>
-              <p style="font-size: 12px; color: var(--text-muted);">Active staff per operational division</p>
+          <div style="background: #FFFFFF; border: 1px solid var(--border); border-radius: 14px; padding: 20px;">
+            <div style="margin-bottom: 14px;">
+              <h3 style="font-size: 14px; font-weight: 700; color: #0F172A; margin: 0;">Department Allocation</h3>
+              <p style="font-size: 11.5px; color: var(--text-muted); margin-top: 2px;">Active staff per operational division</p>
             </div>
-            <div style="height: 280px; position: relative;">
+            <div style="height: 260px; position: relative;">
               <canvas id="chart-dept-distribution"></canvas>
             </div>
           </div>
         </div>
 
-        <!-- Live Punch Stream -->
-        <div style="background: #FFFFFF; border: 1px solid var(--border); border-radius: 14px; padding: 22px;">
-          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;">
+        <!-- ═════════ 4. REAL-TIME PUNCH ACTIVITY STREAM ═════════ -->
+        <div id="live-stream-section" style="background: #FFFFFF; border: 1px solid var(--border); border-radius: 14px; padding: 20px;">
+          
+          <!-- Stream Header: Title + Search & Quick Actions -->
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; flex-wrap: wrap; gap: 12px;">
             <div>
-              <h3 style="font-size: 14.5px; font-weight: 700; color: #0F172A;">Real-Time Punch Activity Stream</h3>
-              <p style="font-size: 12px; color: var(--text-muted);">Live updates from biometric hardware terminals & mobile attendance</p>
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <h3 style="font-size: 15px; font-weight: 700; color: #0F172A; margin: 0;">Real-Time Punch Activity Stream</h3>
+                <span style="display: inline-flex; align-items: center; gap: 5px; font-size: 10px; font-weight: 700; color: #10B981; background: #ECFDF5; border: 1px solid #A7F3D0; padding: 2px 7px; border-radius: 10px; letter-spacing: 0.5px;">
+                  <span style="width: 5px; height: 5px; background: #10B981; border-radius: 50%; display: inline-block;"></span> LIVE
+                </span>
+                <span id="stream-active-filter-indicator" style="display: none; font-size: 11px; background: var(--primary-subtle); color: var(--primary-dark); padding: 2px 8px; border-radius: 8px; font-weight: 700;">
+                  Filtered: <span id="stream-active-filter-name">Present</span>
+                  <button type="button" onclick="setStreamFilter('all')" style="background:none;border:none;color:#DC2626;cursor:pointer;padding:0;font-weight:700;margin-left:4px;" title="Reset to All">✕</button>
+                </span>
+              </div>
+              <p style="font-size: 11.5px; color: var(--text-muted); margin-top: 2px;">Live check-ins from biometric terminals and mobile GPS check-ins</p>
             </div>
-            <button class="btn btn-outline btn-sm" onclick="switchTab('attendance')">View All Attendance →</button>
+            
+            <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+              <!-- Quick Search inside Stream -->
+              <div style="position: relative; width: 220px;">
+                <input type="text" id="stream-search-input" class="form-control" style="padding-left: 30px; padding-right: 26px; font-size: 12px; height: 32px; border-radius: 6px;" placeholder="Search employee, ID, dept..." oninput="handleStreamSearch(event)">
+                <i data-lucide="search" style="position: absolute; left: 9px; top: 50%; transform: translateY(-50%); width: 13px; height: 13px; color: var(--text-muted); pointer-events: none;"></i>
+                <button type="button" id="stream-search-clear" onclick="clearStreamSearch()" style="position: absolute; right: 7px; top: 50%; transform: translateY(-50%); background: none; border: none; color: #94A3B8; cursor: pointer; display: none; padding: 0;" title="Clear">
+                  <i data-lucide="x" style="width: 12px; height: 12px;"></i>
+                </button>
+              </div>
+              <button class="btn btn-outline btn-sm" onclick="loadActivityStream()" title="Refresh stream records" style="height: 32px; padding: 4px 10px; font-size: 11.5px; display: inline-flex; align-items: center; gap: 5px;">
+                <i data-lucide="refresh-cw" style="width: 13px; height: 13px;"></i>
+                <span>Refresh</span>
+              </button>
+              <button class="btn btn-outline btn-sm" onclick="switchTab('attendance')" style="height: 32px; padding: 4px 10px; font-size: 11.5px;">View Full Attendance →</button>
+            </div>
           </div>
-          <div style="overflow-x: auto;">
-            <table class="data-table">
+
+          <!-- Segmented Filter Bar + Meta / Pagination (Unified Row) -->
+          <div class="stream-segmented-bar-wrap">
+            <div class="stream-segmented-bar" id="stream-filter-segmented-bar">
+              <button class="seg-item active" id="stream-btn-all" onclick="setStreamFilter('all')">
+                <span>All Activity</span>
+                <span class="seg-count" id="stream-count-all">--</span>
+              </button>
+
+              <button class="seg-item" id="stream-btn-present" onclick="setStreamFilter('present')">
+                <span class="seg-dot dot-present"></span>
+                <span>Present</span>
+                <span class="seg-count" id="stream-count-present">--</span>
+              </button>
+
+              <button class="seg-item" id="stream-btn-active" onclick="setStreamFilter('active')">
+                <span class="seg-dot dot-active"></span>
+                <span>Checked In</span>
+                <span class="seg-count" id="stream-count-active">--</span>
+              </button>
+
+              <button class="seg-item" id="stream-btn-leave" onclick="setStreamFilter('leave')">
+                <span class="seg-dot dot-leave"></span>
+                <span>On Leave</span>
+                <span class="seg-count" id="stream-count-leave">--</span>
+              </button>
+
+              <button class="seg-item" id="stream-btn-absent" onclick="setStreamFilter('absent')">
+                <span class="seg-dot dot-absent"></span>
+                <span>Absent</span>
+                <span class="seg-count" id="stream-count-absent">--</span>
+              </button>
+
+              <button class="seg-item" id="stream-btn-late" onclick="setStreamFilter('late')">
+                <span class="seg-dot dot-late"></span>
+                <span>Late Arrivals</span>
+                <span class="seg-count" id="stream-count-late">--</span>
+              </button>
+
+              <button class="seg-item" id="stream-btn-unclosed" onclick="setStreamFilter('unclosed')">
+                <span class="seg-dot dot-unclosed"></span>
+                <span>Unclosed</span>
+                <span class="seg-count" id="stream-count-unclosed">--</span>
+              </button>
+            </div>
+
+            <!-- Integrated Pagination & Record Range -->
+            <div class="stream-meta-pagination">
+              <span class="stream-range-info">Showing <strong id="stream-range-text">--</strong> of <strong id="stream-total-text">--</strong></span>
+              <div class="stream-page-btns">
+                <button class="btn-page" id="stream-prev-btn" onclick="changeStreamPage(-1)" disabled title="Previous page">‹</button>
+                <span id="stream-page-label" class="stream-page-label">1 / 1</span>
+                <button class="btn-page" id="stream-next-btn" onclick="changeStreamPage(1)" disabled title="Next page">›</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Table Container (Fixed Col Widths & Stable Min-Height for Smooth Filter Transitions) -->
+          <div class="stream-table-wrapper" style="overflow-x: auto; min-height: 460px; border-radius: 10px; border: 1px solid #E2E8F0; background: #FFFFFF; position: relative;">
+            <table class="data-table" style="table-layout: fixed; width: 100%; min-width: 880px; border-collapse: separate; border-spacing: 0;">
+              <colgroup>
+                <col style="width: 25%;">
+                <col style="width: 15%;">
+                <col style="width: 13%;">
+                <col style="width: 13%;">
+                <col style="width: 12%;">
+                <col style="width: 12%;">
+                <col style="width: 10%;">
+              </colgroup>
               <thead>
-                <tr>
-                  <th>Employee</th>
-                  <th>Department</th>
-                  <th>Date</th>
-                  <th>Clock In</th>
-                  <th>Clock Out</th>
-                  <th>Terminal / Location</th>
-                  <th>Geofence Range</th>
+                <tr id="stream-table-header-row">
+                  <th style="width: 25%;">Employee</th>
+                  <th style="width: 15%;">Department</th>
+                  <th style="width: 13%;">Date / Period</th>
+                  <th style="width: 13%;">Clock In / Status</th>
+                  <th style="width: 12%;">Clock Out / Duration</th>
+                  <th style="width: 12%;">Terminal / Location</th>
+                  <th style="width: 10%;">Status</th>
                 </tr>
               </thead>
-              <tbody id="table-recent-activity">
-                <tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 24px;">Loading real-time punch records...</td></tr>
+              <tbody id="table-recent-activity" style="transition: opacity 0.18s ease-in-out;">
+                <tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 36px;">Loading real-time punch records...</td></tr>
               </tbody>
             </table>
           </div>
         </div>
       </section>
-
-      <!-- ═════════════════ TAB 2: EMPLOYEES DIRECTORY ═════════════════ -->
-      <section id="view-employees" style="display: none;">
+<section id="view-employees" style="display: none;">
         <div style="background: #FFFFFF; border: 1px solid var(--border); border-radius: 14px; padding: 20px; margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 14px;">
           <div style="display: flex; align-items: center; gap: 12px; flex: 1; max-width: 650px;">
             <div style="position: relative; flex: 1; min-width: 260px;">
@@ -10742,7 +11338,12 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
       mapMarkers: [],
       mapPolylines: [],
       gpsData: null,
-      gpsFilter: 'all'
+      gpsFilter: 'all',
+      streamFilter: 'all',
+      streamPage: 1,
+      streamLimit: 25,
+      streamSearch: '',
+      streamTotalPages: 1
     };
 
     // Digital Clock
@@ -10938,7 +11539,7 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
         const res = await fetch(`/api/admin/dashboard-stats?period=${state.period}`, {
           headers: { 'Authorization': `Bearer ${state.token}` }
         });
-        if (res.status === 401 || res.status === 403) return showModal('modal-admin-login');
+        if (res.status === 401 || res.status === 403) return showLoginPage();
         const d = await res.json();
         if (d.error) return;
 
@@ -10997,33 +11598,370 @@ ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
         // Render Dept Distribution
         renderDeptChart(d.charts.department_stats);
 
-        // Recent Activity Table
-        const tb = document.getElementById('table-recent-activity');
-        if (!d.recent_activity || d.recent_activity.length === 0) {
-          tb.innerHTML = '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 20px;">No punches registered for this selected period.</td></tr>';
-        } else {
-          tb.innerHTML = d.recent_activity.map(r => `
-            <tr>
-              <td>
-                <div style="font-weight: 700; color: #0F172A;">${escapeHtml(r.employee_name)}</div>
-                <div style="font-size: 11px; color: var(--text-muted);">#${r.employee_id}</div>
-              </td>
-              <td>${escapeHtml(r.department)}</td>
-              <td>${r.date}</td>
-              <td><span style="font-weight: 700; color: #10B981;">${r.sign_in || '--'}</span></td>
-              <td><span style="font-weight: 700; color: #64748B;">${r.sign_out || '--'}</span></td>
-              <td>${escapeHtml(r.location)}</td>
-              <td>
-                <span class="badge ${r.in_geofence ? 'badge-green' : 'badge-amber'}">
-                  ${r.in_geofence ? '✓ In Geofence' : '⚠ Out of Range'}
-                </span>
-              </td>
-            </tr>
-          `).join('');
-        }
+        // Populate initial pill count badges from KPIs
+        if (document.getElementById('stream-count-all')) document.getElementById('stream-count-all').innerText = (k.present_today || k.total_employees).toLocaleString();
+        if (document.getElementById('stream-count-present')) document.getElementById('stream-count-present').innerText = k.present_today.toLocaleString();
+        if (document.getElementById('stream-count-active')) document.getElementById('stream-count-active').innerText = k.checked_in_active.toLocaleString();
+        if (document.getElementById('stream-count-leave')) document.getElementById('stream-count-leave').innerText = k.on_leave_today.toLocaleString();
+        if (document.getElementById('stream-count-absent')) document.getElementById('stream-count-absent').innerText = k.absent_today.toLocaleString();
+        if (document.getElementById('stream-count-late')) document.getElementById('stream-count-late').innerText = k.late_arrivals.toLocaleString();
+        if (document.getElementById('stream-count-unclosed')) document.getElementById('stream-count-unclosed').innerText = k.unclosed_shifts.toLocaleString();
+
+        // Load Activity Stream dynamically with current stream filter
+        loadActivityStream();
       } catch (err) {
         console.error('Error loading dashboard stats:', err);
       }
+    }
+
+    // ─── Real-Time Punch Activity Stream Controls ───
+    function setStreamFilter(fKey, fromTopCard = false) {
+      state.streamFilter = fKey;
+      state.streamPage = 1;
+      updateStreamFilterPillsUI();
+      updateActiveKpiCardHighlight(fKey);
+      loadActivityStream();
+
+      // Only scroll if clicked from top cards AND stream section is not already well in view
+      if (fromTopCard) {
+        const el = document.getElementById('live-stream-section');
+        if (el) {
+          const rect = el.getBoundingClientRect();
+          const inView = (rect.top >= 50 && rect.top <= (window.innerHeight || document.documentElement.clientHeight) * 0.45);
+          if (!inView) {
+            el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }
+        }
+      }
+    }
+
+    function updateActiveKpiCardHighlight(fKey) {
+      document.querySelectorAll('.kpi-card-clickable').forEach(el => el.classList.remove('active-kpi-filter'));
+      const idMap = {
+        'all': 'kpi-card-total',
+        'present': 'kpi-card-present',
+        'absent': 'kpi-card-absent',
+        'leave': 'kpi-card-leave',
+        'active': 'kpi-card-active',
+        'late': 'kpi-card-late',
+        'unclosed': 'kpi-card-unclosed'
+      };
+      const cardId = idMap[fKey];
+      if (cardId) {
+        const card = document.getElementById(cardId);
+        if (card) card.classList.add('active-kpi-filter');
+      }
+
+      // Update top pulse subtitle hint
+      const hintMap = {
+        'all': 'All Activity',
+        'present': 'Present Today',
+        'active': 'Active Checked In',
+        'leave': 'On Leave',
+        'absent': 'Absent Today',
+        'late': 'Late Arrivals',
+        'unclosed': 'Unclosed Shifts'
+      };
+      const hintEl = document.getElementById('kpi-active-filter-hint');
+      if (hintEl) {
+        hintEl.innerText = 'Active Filter: ' + (hintMap[fKey] || fKey);
+      }
+    }
+
+    function updateStreamFilterPillsUI() {
+      const allBtns = ['all', 'present', 'active', 'leave', 'absent', 'late', 'unclosed'];
+      allBtns.forEach(id => {
+        const btn = document.getElementById('stream-btn-' + id);
+        if (btn) {
+          btn.className = 'seg-item';
+          if (id === state.streamFilter) {
+            btn.classList.add('active');
+          }
+        }
+      });
+
+      // Update stream header filter indicator
+      const indEl = document.getElementById('stream-active-filter-indicator');
+      const nameEl = document.getElementById('stream-active-filter-name');
+      if (indEl && nameEl) {
+        const labels = {
+          'all': 'All Activity',
+          'present': 'Present Today',
+          'active': 'Active Checked In',
+          'leave': 'On Leave',
+          'absent': 'Absent Today',
+          'late': 'Late Arrivals',
+          'unclosed': 'Unclosed Shifts'
+        };
+        if (state.streamFilter === 'all' && !state.streamSearch) {
+          indEl.style.display = 'none';
+        } else {
+          indEl.style.display = 'inline-flex';
+          nameEl.innerText = (labels[state.streamFilter] || state.streamFilter) + (state.streamSearch ? ` • "${state.streamSearch}"` : '');
+        }
+      }
+
+      // Stable unified headers maintained across all filters (prevents column layout shift)
+      const headerRow = document.getElementById('stream-table-header-row');
+      if (headerRow) {
+        if (state.streamFilter === 'leave') {
+          headerRow.innerHTML = `
+            <th style="width: 25%;">Employee</th>
+            <th style="width: 15%;">Department</th>
+            <th style="width: 13%;">Leave Period</th>
+            <th style="width: 13%;">Leave Status</th>
+            <th style="width: 12%;">Leave Type</th>
+            <th style="width: 12%;">Reason / Purpose</th>
+            <th style="width: 10%;">Status</th>
+          `;
+        } else if (state.streamFilter === 'absent') {
+          headerRow.innerHTML = `
+            <th style="width: 25%;">Employee</th>
+            <th style="width: 15%;">Department</th>
+            <th style="width: 13%;">Date</th>
+            <th style="width: 13%;">Duty Status</th>
+            <th style="width: 12%;">Clock Out</th>
+            <th style="width: 12%;">Terminal / Notes</th>
+            <th style="width: 10%;">Status</th>
+          `;
+        } else {
+          headerRow.innerHTML = `
+            <th style="width: 25%;">Employee</th>
+            <th style="width: 15%;">Department</th>
+            <th style="width: 13%;">Date / Period</th>
+            <th style="width: 13%;">Clock In / Status</th>
+            <th style="width: 12%;">Clock Out / Duration</th>
+            <th style="width: 12%;">Terminal / Location</th>
+            <th style="width: 10%;">Status</th>
+          `;
+        }
+      }
+    }
+
+    async function loadActivityStream() {
+      const tb = document.getElementById('table-recent-activity');
+      if (!tb) return;
+
+      // Smooth opacity fade out during transition
+      tb.style.opacity = '0.35';
+
+      try {
+        const q = new URLSearchParams({
+          period: state.period || 'today',
+          filter: state.streamFilter || 'all',
+          search: (state.streamSearch || '').trim(),
+          page: state.streamPage || 1,
+          limit: state.streamLimit || 25
+        });
+
+        const res = await fetch(`/api/admin/dashboard/activity-stream?${q.toString()}`, {
+          headers: { 'Authorization': `Bearer ${state.token}` }
+        });
+        if (!res.ok) throw new Error('Failed to load activity stream');
+        const data = await res.json();
+
+        // Update live counts on filter pills
+        if (data.counts) {
+          if (document.getElementById('stream-count-all')) document.getElementById('stream-count-all').innerText = (data.counts.all || 0).toLocaleString();
+          if (document.getElementById('stream-count-present')) document.getElementById('stream-count-present').innerText = (data.counts.present || 0).toLocaleString();
+          if (document.getElementById('stream-count-active')) document.getElementById('stream-count-active').innerText = (data.counts.active || 0).toLocaleString();
+          if (document.getElementById('stream-count-leave')) document.getElementById('stream-count-leave').innerText = (data.counts.leave || 0).toLocaleString();
+          if (document.getElementById('stream-count-absent')) document.getElementById('stream-count-absent').innerText = (data.counts.absent || 0).toLocaleString();
+          if (document.getElementById('stream-count-late')) document.getElementById('stream-count-late').innerText = (data.counts.late || 0).toLocaleString();
+          if (document.getElementById('stream-count-unclosed')) document.getElementById('stream-count-unclosed').innerText = (data.counts.unclosed || 0).toLocaleString();
+        }
+
+        // Update pagination & range info
+        const total = data.total || 0;
+        const page = data.page || 1;
+        const limit = data.limit || 25;
+        state.streamTotalPages = data.total_pages || 1;
+
+        const startIdx = total === 0 ? 0 : (page - 1) * limit + 1;
+        const endIdx = Math.min(total, page * limit);
+
+        const rangeEl = document.getElementById('stream-range-text');
+        if (rangeEl) rangeEl.innerText = `${startIdx}-${endIdx}`;
+        const totEl = document.getElementById('stream-total-text');
+        if (totEl) totEl.innerText = total.toLocaleString();
+
+        const pageLbl = document.getElementById('stream-page-label');
+        if (pageLbl) pageLbl.innerText = `${page} / ${Math.max(1, state.streamTotalPages)}`;
+
+        const prevBtn = document.getElementById('stream-prev-btn');
+        if (prevBtn) prevBtn.disabled = (page <= 1);
+        const nextBtn = document.getElementById('stream-next-btn');
+        if (nextBtn) nextBtn.disabled = (page >= state.streamTotalPages);
+
+        // Render records
+        if (!data.records || data.records.length === 0) {
+          tb.innerHTML = `<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: 48px 16px;">
+            <div style="font-weight: 700; font-size: 14px; color: #475569; margin-bottom: 4px;">No records found</div>
+            <div style="font-size: 12px; color: #94A3B8;">No records match the current filter and search query.</div>
+          </td></tr>`;
+          return;
+        }
+
+        let rowsHtml = data.records.map(r => renderStreamRow(r)).join('');
+
+        // When viewing On Leave with only a few records (e.g. 1 employee), display an intentional, polished status card
+        if (state.streamFilter === 'leave') {
+          rowsHtml += `
+            <tr style="background: linear-gradient(180deg, #FAF5FF 0%, #FFFFFF 100%);">
+              <td colspan="7" style="padding: 38px 20px; text-align: center; border-top: 1px dashed #DDD6FE; border-bottom: none;">
+                <div style="max-width: 480px; margin: 0 auto;">
+                  <div style="display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: 12px; background: #EDE9FE; color: #7C3AED; margin-bottom: 10px;">
+                    <i data-lucide="calendar-check-2" style="width: 20px; height: 20px;"></i>
+                  </div>
+                  <div style="font-size: 13.5px; font-weight: 700; color: #4C1D95; margin-bottom: 4px;">
+                    ${total} Employee on Approved Absence Today
+                  </div>
+                  <div style="font-size: 12px; color: #6D28D9; line-height: 1.5;">
+                    All other active staff members in the workforce directory are scheduled on active duty.
+                  </div>
+                </div>
+              </td>
+            </tr>
+          `;
+        }
+
+        tb.innerHTML = rowsHtml;
+        if (window.lucide) lucide.createIcons();
+
+      } catch (err) {
+        console.error('Error loading activity stream:', err);
+        tb.innerHTML = `<tr><td colspan="7" style="text-align: center; color: #EF4444; padding: 24px;">Failed to load punch stream. Click Refresh to retry.</td></tr>`;
+      } finally {
+        requestAnimationFrame(() => {
+          tb.style.opacity = '1';
+        });
+      }
+    }
+
+    function renderStreamRow(r) {
+      const recType = r.record_type || 'attendance';
+      const name = r.employee_name || ('Employee #' + r.employee_id);
+      const initials = (name.split(' ').filter(Boolean).map(n => n[0]).slice(0, 2).join('') || 'EM').toUpperCase();
+
+      if (recType === 'leave') {
+        return `
+          <tr style="background: #FFFFFF;">
+            <td>
+              <div style="display: flex; align-items: center; gap: 10px;">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: #EDE9FE; color: #7C3AED; font-weight: 700; font-size: 11px; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">${initials}</div>
+                <div>
+                  <div style="font-weight: 700; color: #0F172A;">${escapeHtml(r.employee_name)}</div>
+                  <div style="font-size: 11px; color: var(--text-muted);">#${r.employee_id} • ${escapeHtml(r.designation || 'Staff')}</div>
+                </div>
+              </div>
+            </td>
+            <td><span style="font-weight: 600; color: #334155;">${escapeHtml(r.department)}</span></td>
+            <td><span style="font-weight: 600; color: #475569;">${escapeHtml(r.date)}</span></td>
+            <td><span class="badge" style="background: #EDE9FE; color: #7C3AED; font-weight: 700; font-size: 11px;">✈ On Approved Leave</span></td>
+            <td><span style="font-weight: 700; color: #0F172A;">${escapeHtml(r.sign_out || 'Approved Leave')}</span></td>
+            <td><span style="color: var(--text-muted); font-size: 12px; font-style: italic;" title="${escapeHtml(r.location || '')}">"${escapeHtml(r.location || 'Approved Absence')}"</span></td>
+            <td><span class="badge" style="background: #F3E8FF; color: #6B21A8; font-weight: 700;">✓ HR Approved</span></td>
+          </tr>
+        `;
+      }
+
+      if (recType === 'absent') {
+        return `
+          <tr>
+            <td>
+              <div style="display: flex; align-items: center; gap: 10px;">
+                <div style="width: 32px; height: 32px; border-radius: 8px; background: #FEE2E2; color: #DC2626; font-weight: 700; font-size: 11px; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">${initials}</div>
+                <div>
+                  <div style="font-weight: 700; color: #0F172A;">${escapeHtml(r.employee_name)}</div>
+                  <div style="font-size: 11px; color: var(--text-muted);">#${r.employee_id} • ${escapeHtml(r.designation || 'Staff')}</div>
+                </div>
+              </div>
+            </td>
+            <td><span style="font-weight: 600; color: #334155;">${escapeHtml(r.department)}</span></td>
+            <td><span style="color: #64748B;">${escapeHtml(r.date)}</span></td>
+            <td><span class="badge" style="background: #FEE2E2; color: #DC2626; font-weight: 700; font-size: 11px;">✕ Absent</span></td>
+            <td><span style="color: #94A3B8;">--</span></td>
+            <td><span style="color: #94A3B8; font-size: 12px; font-style: italic;">No punch recorded</span></td>
+            <td><span class="badge" style="background: #F1F5F9; color: #64748B; font-weight: 600;">Not Clocked In</span></td>
+          </tr>
+        `;
+      }
+
+      // Regular attendance punch
+      const isLate = Boolean(r.is_late);
+      const isWorking = Boolean(r.is_active);
+      const clockInColor = isLate ? '#E11D48' : '#10B981';
+
+      let clockOutHtml = '';
+      if (r.sign_out) {
+        clockOutHtml = `<span style="font-weight: 700; color: #64748B;">${r.sign_out}</span>`;
+      } else if (isWorking) {
+        clockOutHtml = `<span class="badge" style="background: #FEF3C7; color: #D97706; font-weight: 700; font-size: 10.5px; display: inline-flex; align-items: center; gap: 4px;"><span style="width: 5px; height: 5px; border-radius: 50%; background: #D97706; display: inline-block;"></span> Shifts in progress</span>`;
+      } else {
+        clockOutHtml = `<span style="color: #94A3B8;">--</span>`;
+      }
+
+      const geofenceBadge = r.in_geofence
+        ? `<span class="badge badge-green">✓ In Geofence</span>`
+        : `<span class="badge badge-amber">⚠ Out of Range</span>`;
+
+      return `
+        <tr>
+          <td>
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <div style="width: 32px; height: 32px; border-radius: 8px; background: #F1F5F9; color: #334155; font-weight: 700; font-size: 11px; display: flex; align-items: center; justify-content: center; flex-shrink: 0;">${initials}</div>
+              <div>
+                <div style="font-weight: 700; color: #0F172A;">${escapeHtml(r.employee_name)}</div>
+                <div style="font-size: 11px; color: var(--text-muted);">#${r.employee_id} • ${escapeHtml(r.designation || 'Staff')}</div>
+              </div>
+            </div>
+          </td>
+          <td><span style="font-weight: 600; color: #334155;">${escapeHtml(r.department)}</span></td>
+          <td><span>${escapeHtml(r.date)}</span></td>
+          <td>
+            <div style="display: flex; align-items: center; gap: 6px;">
+              <span style="font-weight: 700; color: ${clockInColor};">${r.sign_in || '--'}</span>
+              ${isLate ? '<span class="badge" style="background:#FFE4E6;color:#E11D48;font-size:10px;padding:1px 5px;font-weight:700;">Late</span>' : ''}
+            </div>
+          </td>
+          <td>${clockOutHtml}</td>
+          <td><span style="font-size: 12px; color: #334155;">${escapeHtml(r.location || 'Biometric / Mobile')}</span></td>
+          <td>${geofenceBadge}</td>
+        </tr>
+      `;
+    }
+
+    function changeStreamPage(delta) {
+      const newPage = state.streamPage + delta;
+      if (newPage < 1 || newPage > state.streamTotalPages) return;
+      state.streamPage = newPage;
+      loadActivityStream();
+    }
+
+    let streamSearchDebounceTimer = null;
+    function handleStreamSearch(e) {
+      const val = (e && e.target) ? e.target.value : '';
+      const clearBtn = document.getElementById('stream-search-clear');
+      if (clearBtn) clearBtn.style.display = val.trim().length > 0 ? 'inline-block' : 'none';
+
+      clearTimeout(streamSearchDebounceTimer);
+      streamSearchDebounceTimer = setTimeout(() => {
+        state.streamSearch = val.trim();
+        state.streamPage = 1;
+        updateStreamFilterPillsUI();
+        loadActivityStream();
+      }, 250);
+    }
+
+    function clearStreamSearch() {
+      const input = document.getElementById('stream-search-input');
+      if (input) input.value = '';
+      const clearBtn = document.getElementById('stream-search-clear');
+      if (clearBtn) clearBtn.style.display = 'none';
+      state.streamSearch = '';
+      state.streamPage = 1;
+      updateStreamFilterPillsUI();
+      loadActivityStream();
     }
 
     function setPeriodFilter(p) {
